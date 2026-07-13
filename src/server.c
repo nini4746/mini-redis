@@ -4,6 +4,7 @@
 #include "command.h"
 #include "dict.h"
 #include "util.h"
+#include "rdb.h"
 
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -17,6 +18,7 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 serverState server;
@@ -189,7 +191,40 @@ static void active_expire_cycle(void) {
     } while (++loops < 16);
 }
 
+int server_start_bgsave(void) {
+    if (server.rdb_child_pid != -1) return 1; /* already running */
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child: drop all inherited sockets so it can never answer a client,
+         * then dump the fork-time snapshot (COW) and exit. */
+        close(server.listen_fd);
+        close(server.kq);
+        for (int fd = 0; fd < server.clients_cap; fd++)
+            if (server.clients[fd]) close(fd);
+        int ok = (rdb_save(server.db, server.rdb_filename) == 0);
+        _exit(ok ? 0 : 1);
+    }
+    server.rdb_child_pid = pid;
+    return 0;
+}
+
+/* Reap a finished BGSAVE child (non-blocking) so no zombie lingers. */
+static void reap_bgsave(void) {
+    if (server.rdb_child_pid == -1) return;
+    int status;
+    pid_t p = waitpid(server.rdb_child_pid, &status, WNOHANG);
+    if (p == server.rdb_child_pid) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+            fprintf(stderr, "Background saving terminated with success\n");
+        else
+            fprintf(stderr, "Background saving error\n");
+        server.rdb_child_pid = -1;
+    }
+}
+
 static void server_cron(void) {
+    reap_bgsave();
     long long now = mstime();
     if (now - server.last_cron < 100) return; /* ~10Hz */
     server.last_cron = now;
@@ -226,6 +261,21 @@ int main(void) {
     sigaction(SIGPIPE, &sa, NULL);
 
     server.db = db_create();
+    server.rdb_child_pid = -1;
+    server.rdb_filename = "dump.mrdb";
+
+    /* Load a snapshot if present. A corrupt file is fatal (we refuse to
+     * start rather than silently mask data loss with an empty DB). */
+    int lr = rdb_load(server.db, server.rdb_filename);
+    if (lr == RDB_ERR) {
+        fprintf(stderr,
+                "FATAL: RDB file '%s' is corrupt or truncated; refusing to start\n",
+                server.rdb_filename);
+        return 1;
+    }
+    if (lr == RDB_OK)
+        fprintf(stderr, "Loaded %zu keys from %s\n",
+                db_size(server.db), server.rdb_filename);
 
     server.listen_fd = setup_listener();
     if (server.listen_fd < 0) return 1;

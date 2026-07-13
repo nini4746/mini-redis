@@ -6,6 +6,7 @@
 #include "list.h"
 #include "dict.h"
 #include "util.h"
+#include "rdb.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -425,6 +426,25 @@ static void config_cmd(client *c) {
     reply_error(c, "ERR Unknown CONFIG subcommand or wrong number of arguments");
 }
 
+/* ---- persistence ---- */
+
+static void save_cmd(client *c) {
+    if (rdb_save(server.db, server.rdb_filename) == 0)
+        reply_simple(c, "OK");
+    else
+        reply_error(c, "ERR error saving DB on disk");
+}
+
+static void bgsave_cmd(client *c) {
+    int rc = server_start_bgsave();
+    if (rc == 0)
+        reply_simple(c, "Background saving started");
+    else if (rc == 1)
+        reply_error(c, "ERR Background save already in progress");
+    else
+        reply_error(c, "ERR Can't save in background: fork failed");
+}
+
 /* ---- table ---- */
 
 static const command command_table[] = {
@@ -456,6 +476,8 @@ static const command command_table[] = {
     {"TTL", ttl_cmd, 2, 0},
     {"PERSIST", persist_cmd, 2, 0},
     {"CONFIG", config_cmd, -2, 0},
+    {"SAVE", save_cmd, 1, 0},
+    {"BGSAVE", bgsave_cmd, -1, 0},
 };
 
 static const command *lookup_command(const char *name, size_t len) {

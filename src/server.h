@@ -4,6 +4,8 @@
 #include "conn.h"
 #include "db.h"
 
+#include <sys/types.h>
+
 #define SERVER_PORT 6380
 
 typedef struct serverState {
@@ -14,11 +16,17 @@ typedef struct serverState {
     redisDb *db;
     long long maxmemory;   /* 0 = unlimited (eviction disabled) */
     long long last_cron;   /* ms timestamp of last periodic tick */
+    pid_t rdb_child_pid;   /* -1 when no BGSAVE in flight */
+    const char *rdb_filename;
 } serverState;
 
 extern serverState server;
 
 /* Enable/disable interest in writability for a client's fd. */
 void el_set_write(client *c, int enable);
+
+/* Fork a background save. Returns 0 started, -1 fork failed,
+ * 1 a BGSAVE is already in progress. */
+int server_start_bgsave(void);
 
 #endif
