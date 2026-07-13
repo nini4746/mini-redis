@@ -1,4 +1,6 @@
 #include "object.h"
+#include "dict.h"
+#include "list.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,8 +38,12 @@ void obj_free(robj *o) {
     case OBJ_STRING:
         free(o->ptr);
         break;
-    default:
-        /* Collection destructors are added in plan 03. */
+    case OBJ_LIST:
+        list_free(o->ptr);
+        break;
+    case OBJ_HASH: /* dict created with free() as value destructor */
+    case OBJ_SET:  /* dict created with NULL value destructor        */
+        dict_free(o->ptr);
         break;
     }
     free(o);
@@ -45,9 +51,28 @@ void obj_free(robj *o) {
 
 size_t obj_size(const robj *o) {
     size_t sz = sizeof(robj) + 48; /* object + entry overhead estimate */
-    if (o->type == OBJ_STRING) {
+    switch (o->type) {
+    case OBJ_STRING: {
         sstr *s = o->ptr;
         sz += sizeof(sstr) + s->len;
+        break;
+    }
+    case OBJ_LIST:
+        sz += list_bytes(o->ptr);
+        break;
+    case OBJ_HASH:
+    case OBJ_SET: {
+        dict *d = o->ptr;
+        dictIterator it;
+        dict_iter_init(&it, d);
+        dictEntry *e;
+        while ((e = dict_iter_next(&it)) != NULL) {
+            sz += 48 + e->klen;
+            if (o->type == OBJ_HASH && e->val)
+                sz += ((sstr *)e->val)->len;
+        }
+        break;
+    }
     }
     return sz;
 }
