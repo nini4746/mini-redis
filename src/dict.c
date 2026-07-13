@@ -1,4 +1,5 @@
 #include "dict.h"
+#include "zmalloc.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -21,16 +22,16 @@ static int key_eq(const dictEntry *e, const void *key, size_t klen) {
 }
 
 dict *dict_create(dictValFree valfree) {
-    dict *d = calloc(1, sizeof(*d));
+    dict *d = zcalloc(1, sizeof(*d));
     d->size = DICT_INITIAL_SIZE;
     d->mask = d->size - 1;
-    d->table = calloc(d->size, sizeof(dictEntry *));
+    d->table = zcalloc(d->size, sizeof(dictEntry *));
     d->valfree = valfree;
     return d;
 }
 
 static void dict_rehash(dict *d, size_t newsize) {
-    dictEntry **nt = calloc(newsize, sizeof(dictEntry *));
+    dictEntry **nt = zcalloc(newsize, sizeof(dictEntry *));
     size_t nmask = newsize - 1;
     for (size_t i = 0; i < d->size; i++) {
         dictEntry *e = d->table[i];
@@ -42,7 +43,7 @@ static void dict_rehash(dict *d, size_t newsize) {
             e = next;
         }
     }
-    free(d->table);
+    zfree(d->table);
     d->table = nt;
     d->size = newsize;
     d->mask = nmask;
@@ -74,8 +75,8 @@ int dict_set(dict *d, const void *key, size_t klen, void *val) {
             return 0;
         }
     }
-    dictEntry *e = malloc(sizeof(*e));
-    e->key = malloc(klen ? klen : 1);
+    dictEntry *e = zmalloc(sizeof(*e));
+    e->key = zmalloc(klen ? klen : 1);
     memcpy(e->key, key, klen);
     e->klen = klen;
     e->val = val;
@@ -94,8 +95,8 @@ int dict_del(dict *d, const void *key, size_t klen) {
             if (prev) prev->next = e->next;
             else d->table[idx] = e->next;
             if (d->valfree) d->valfree(e->val);
-            free(e->key);
-            free(e);
+            zfree(e->key);
+            zfree(e);
             d->used--;
             return 1;
         }
@@ -110,13 +111,13 @@ void dict_free(dict *d) {
         while (e) {
             dictEntry *next = e->next;
             if (d->valfree) d->valfree(e->val);
-            free(e->key);
-            free(e);
+            zfree(e->key);
+            zfree(e);
             e = next;
         }
     }
-    free(d->table);
-    free(d);
+    zfree(d->table);
+    zfree(d);
 }
 
 dictEntry *dict_random(dict *d) {

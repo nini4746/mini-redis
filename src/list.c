@@ -1,9 +1,10 @@
 #include "list.h"
+#include "zmalloc.h"
 
 #include <stdlib.h>
 
 mlist *list_new(void) {
-    mlist *l = calloc(1, sizeof(*l));
+    mlist *l = zcalloc(1, sizeof(*l));
     return l;
 }
 
@@ -12,15 +13,15 @@ void list_free(mlist *l) {
     listNode *n = l->head;
     while (n) {
         listNode *next = n->next;
-        free(n->value);
-        free(n);
+        zfree(n->value);
+        zfree(n);
         n = next;
     }
-    free(l);
+    zfree(l);
 }
 
 void list_push_head(mlist *l, const void *p, size_t len) {
-    listNode *n = malloc(sizeof(*n));
+    listNode *n = zmalloc(sizeof(*n));
     n->value = sstr_new(p, len);
     n->prev = NULL;
     n->next = l->head;
@@ -31,7 +32,7 @@ void list_push_head(mlist *l, const void *p, size_t len) {
 }
 
 void list_push_tail(mlist *l, const void *p, size_t len) {
-    listNode *n = malloc(sizeof(*n));
+    listNode *n = zmalloc(sizeof(*n));
     n->value = sstr_new(p, len);
     n->next = NULL;
     n->prev = l->tail;
@@ -49,7 +50,7 @@ sstr *list_pop_head(mlist *l) {
     else l->tail = NULL;
     l->len--;
     sstr *v = n->value;
-    free(n);
+    zfree(n);
     return v;
 }
 
@@ -61,7 +62,7 @@ sstr *list_pop_tail(mlist *l) {
     else l->head = NULL;
     l->len--;
     sstr *v = n->value;
-    free(n);
+    zfree(n);
     return v;
 }
 

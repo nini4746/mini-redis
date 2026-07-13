@@ -1,4 +1,5 @@
 #include "object.h"
+#include "zmalloc.h"
 #include "dict.h"
 #include "list.h"
 
@@ -7,7 +8,7 @@
 #include <string.h>
 
 sstr *sstr_new(const void *p, size_t len) {
-    sstr *s = malloc(sizeof(sstr) + len + 1);
+    sstr *s = zmalloc(sizeof(sstr) + len + 1);
     s->len = len;
     if (len && p) memcpy(s->data, p, len);
     s->data[len] = '\0';
@@ -15,7 +16,7 @@ sstr *sstr_new(const void *p, size_t len) {
 }
 
 robj *obj_new(obj_type type, void *ptr) {
-    robj *o = malloc(sizeof(*o));
+    robj *o = zmalloc(sizeof(*o));
     o->type = type;
     o->ptr = ptr;
     o->lru = 0;
@@ -36,17 +37,17 @@ void obj_free(robj *o) {
     if (!o) return;
     switch (o->type) {
     case OBJ_STRING:
-        free(o->ptr);
+        zfree(o->ptr);
         break;
     case OBJ_LIST:
         list_free(o->ptr);
         break;
-    case OBJ_HASH: /* dict created with free() as value destructor */
+    case OBJ_HASH: /* dict created with zfree() as value destructor */
     case OBJ_SET:  /* dict created with NULL value destructor        */
         dict_free(o->ptr);
         break;
     }
-    free(o);
+    zfree(o);
 }
 
 size_t obj_size(const robj *o) {

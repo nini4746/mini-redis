@@ -1,8 +1,12 @@
 #include "server.h"
+#include "zmalloc.h"
 #include "resp.h"
 #include "command.h"
+#include "dict.h"
+#include "util.h"
 
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -27,7 +31,7 @@ static void clients_ensure(int fd) {
     if (fd < server.clients_cap) return;
     int cap = server.clients_cap ? server.clients_cap : 64;
     while (cap <= fd) cap *= 2;
-    server.clients = realloc(server.clients, (size_t)cap * sizeof(client *));
+    server.clients = zrealloc(server.clients, (size_t)cap * sizeof(client *));
     for (int i = server.clients_cap; i < cap; i++) server.clients[i] = NULL;
     server.clients_cap = cap;
 }
@@ -74,6 +78,11 @@ static int flush_write(client *c) {
     /* Fully drained. */
     c->wsent = 0;
     c->wlen = 0;
+    if (c->wcap > 65536) { /* release oversized reply buffer */
+        zfree(c->wbuf);
+        c->wbuf = NULL;
+        c->wcap = 0;
+    }
     el_set_write(c, 0);
     if (c->flags & CLIENT_CLOSE_AFTER_WRITE) return -1;
     return 0;
@@ -116,6 +125,13 @@ static void read_from_client(client *c) {
         }
     }
     process_input(c);
+    /* Release an oversized read buffer once fully consumed, so a single
+     * large request doesn't pin memory (and skew maxmemory) forever. */
+    if (c->rlen == 0 && c->rcap > 65536) {
+        zfree(c->rbuf);
+        c->rbuf = NULL;
+        c->rcap = 0;
+    }
     if (flush_write(c) < 0) close_client(c);
 }
 
@@ -136,6 +152,48 @@ static void accept_clients(void) {
         server.clients[fd] = c;
         kq_change(fd, EVFILT_READ, EV_ADD | EV_ENABLE);
     }
+}
+
+/* Active expiry: sample random keys from the expire table and drop the
+ * ones already past their deadline. If a sampled batch was heavily
+ * expired, keep going (bounded by a time budget) so bursts of expirations
+ * are reclaimed without a full scan. */
+static void active_expire_cycle(void) {
+    redisDb *db = server.db;
+    long long start = mstime();
+    int loops = 0;
+    do {
+        if (dict_size(db->expires) == 0) return;
+        int sampled = 0, expired = 0;
+        long long now = mstime();
+        for (int i = 0; i < 20; i++) {
+            dictEntry *e = dict_random(db->expires);
+            if (!e) break;
+            sampled++;
+            long long when = (long long)(intptr_t)e->val;
+            if (now >= when) {
+                /* Copy the key: db_delete frees the expire entry (and its
+                 * key copy) before touching the keyspace dict. */
+                size_t kl = e->klen;
+                char *k = zmalloc(kl ? kl : 1);
+                memcpy(k, e->key, kl);
+                db_delete(db, k, kl);
+                zfree(k);
+                expired++;
+            }
+        }
+        if (sampled == 0) return;
+        /* Stop once expirations fall below ~25% of the sample. */
+        if (expired * 4 <= sampled) return;
+        if (mstime() - start > 25) return; /* time cap: don't stall the loop */
+    } while (++loops < 16);
+}
+
+static void server_cron(void) {
+    long long now = mstime();
+    if (now - server.last_cron < 100) return; /* ~10Hz */
+    server.last_cron = now;
+    active_expire_cycle();
 }
 
 static int setup_listener(void) {
@@ -179,14 +237,18 @@ int main(void) {
 
     fprintf(stderr, "mini-redis listening on port %d\n", SERVER_PORT);
 
+    server.last_cron = mstime();
+
     struct kevent events[256];
+    struct timespec ts = { 0, 100 * 1000 * 1000 }; /* 100ms tick */
     for (;;) {
-        int n = kevent(server.kq, NULL, 0, events, 256, NULL);
+        int n = kevent(server.kq, NULL, 0, events, 256, &ts);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) { server_cron(); continue; }
             perror("kevent");
             break;
         }
+        server_cron();
         for (int i = 0; i < n; i++) {
             int fd = (int)events[i].ident;
             if (fd == server.listen_fd) {

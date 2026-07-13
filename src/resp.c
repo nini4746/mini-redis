@@ -1,4 +1,5 @@
 #include "resp.h"
+#include "zmalloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,13 +40,13 @@ static void argv_ensure(client *c, int n) {
     if (n <= c->argv_cap) return;
     int cap = c->argv_cap ? c->argv_cap : 4;
     while (cap < n) cap *= 2;
-    c->argv = realloc(c->argv, (size_t)cap * sizeof(arg));
+    c->argv = zrealloc(c->argv, (size_t)cap * sizeof(arg));
     c->argv_cap = cap;
 }
 
 void resp_free_argv(client *c) {
     for (int i = 0; i < c->argc; i++) {
-        free(c->argv[i].data);
+        zfree(c->argv[i].data);
         c->argv[i].data = NULL;
     }
     c->argc = 0;
@@ -86,7 +87,7 @@ int resp_parse(client *c) {
 
     /* Temporary holding of parsed args; only commit once the full
      * command has been assembled so incomplete input leaves rbuf intact. */
-    arg *tmp = malloc((size_t)count * sizeof(arg));
+    arg *tmp = zmalloc((size_t)count * sizeof(arg));
     if (!tmp) return -1;
     long long parsed = 0;
     int rc = 0; /* 0=need more, 1=done, -1=error */
@@ -107,7 +108,7 @@ int resp_parse(client *c) {
         if (data_end + 2 > len) { rc = 0; goto cleanup; } /* need data + \r\n */
         if (buf[data_end] != '\r' || buf[data_end + 1] != '\n') { rc = -1; goto cleanup; }
 
-        tmp[i].data = malloc((size_t)blen + 1);
+        tmp[i].data = zmalloc((size_t)blen + 1);
         if (!tmp[i].data) { rc = -1; goto cleanup; }
         memcpy(tmp[i].data, buf + data_start, (size_t)blen);
         tmp[i].data[blen] = '\0';
@@ -122,14 +123,14 @@ cleanup:
         /* Commit: move parsed args into client, consume from rbuf. */
         for (long long i = 0; i < count; i++) c->argv[i] = tmp[i];
         c->argc = (int)count;
-        free(tmp);
+        zfree(tmp);
         memmove(c->rbuf, c->rbuf + pos, c->rlen - pos);
         c->rlen -= pos;
         return 1;
     }
     /* Not committed: free anything we allocated. */
-    for (long long i = 0; i < parsed; i++) free(tmp[i].data);
-    free(tmp);
+    for (long long i = 0; i < parsed; i++) zfree(tmp[i].data);
+    zfree(tmp);
     return rc;
 }
 

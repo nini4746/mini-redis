@@ -12,6 +12,8 @@ typedef struct serverState {
     client **clients;   /* indexed by fd */
     int clients_cap;
     redisDb *db;
+    long long maxmemory;   /* 0 = unlimited (eviction disabled) */
+    long long last_cron;   /* ms timestamp of last periodic tick */
 } serverState;
 
 extern serverState server;
