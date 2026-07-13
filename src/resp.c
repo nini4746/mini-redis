@@ -36,6 +36,8 @@ static int parse_int(const char *buf, size_t from, size_t end, long long *out) {
     return 0;
 }
 
+#define RESP_MAX_INLINE     (64 * 1024)  /* max inline command line length */
+
 static void argv_ensure(client *c, int n) {
     if (n <= c->argv_cap) return;
     int cap = c->argv_cap ? c->argv_cap : 4;
@@ -52,12 +54,72 @@ void resp_free_argv(client *c) {
     c->argc = 0;
 }
 
+/* Parse an inline command: a single line (terminated by \n, optional \r)
+ * split on whitespace into arguments. redis-benchmark's PING_INLINE test and
+ * telnet-style clients use this form. Returns 0=need more, 1=done, -1=error. */
+static int resp_parse_inline(client *c) {
+    const char *buf = c->rbuf;
+    size_t len = c->rlen;
+
+    /* Locate end of line. */
+    const char *nl = memchr(buf, '\n', len);
+    if (!nl) {
+        if (len > RESP_MAX_INLINE) return -1; /* line too long */
+        return 0; /* wait for more */
+    }
+    size_t line_end = (size_t)(nl - buf);   /* index of '\n' */
+    size_t consumed = line_end + 1;
+    size_t tok_end = line_end;
+    if (tok_end > 0 && buf[tok_end - 1] == '\r') tok_end--; /* drop trailing \r */
+
+    /* First pass: count whitespace-delimited tokens. */
+    int ntok = 0;
+    size_t i = 0;
+    while (i < tok_end) {
+        while (i < tok_end && (buf[i] == ' ' || buf[i] == '\t')) i++;
+        if (i >= tok_end) break;
+        ntok++;
+        while (i < tok_end && buf[i] != ' ' && buf[i] != '\t') i++;
+    }
+
+    if (ntok == 0) { /* blank line: consume, run nothing */
+        memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
+        c->rlen -= consumed;
+        c->argc = 0;
+        return 1;
+    }
+
+    argv_ensure(c, ntok);
+    int a = 0;
+    i = 0;
+    while (i < tok_end && a < ntok) {
+        while (i < tok_end && (buf[i] == ' ' || buf[i] == '\t')) i++;
+        if (i >= tok_end) break;
+        size_t start = i;
+        while (i < tok_end && buf[i] != ' ' && buf[i] != '\t') i++;
+        size_t tlen = i - start;
+        c->argv[a].data = zmalloc(tlen + 1);
+        if (!c->argv[a].data) {
+            for (int j = 0; j < a; j++) { zfree(c->argv[j].data); c->argv[j].data = NULL; }
+            return -1;
+        }
+        memcpy(c->argv[a].data, buf + start, tlen);
+        c->argv[a].data[tlen] = '\0';
+        c->argv[a].len = tlen;
+        a++;
+    }
+    c->argc = a;
+    memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
+    c->rlen -= consumed;
+    return 1;
+}
+
 int resp_parse(client *c) {
     const char *buf = c->rbuf;
     size_t len = c->rlen;
     if (len == 0) return 0;
 
-    if (buf[0] != '*') return -1; /* only multibulk accepted */
+    if (buf[0] != '*') return resp_parse_inline(c); /* inline command form */
 
     /* Parse *<count>\r\n */
     long crlf = find_crlf(buf, len, 1);
