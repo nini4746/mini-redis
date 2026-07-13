@@ -167,6 +167,8 @@ int main(void) {
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
 
+    server.db = db_create();
+
     server.listen_fd = setup_listener();
     if (server.listen_fd < 0) return 1;
 

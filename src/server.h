@@ -2,6 +2,7 @@
 #define SERVER_H
 
 #include "conn.h"
+#include "db.h"
 
 #define SERVER_PORT 6380
 
@@ -10,6 +11,7 @@ typedef struct serverState {
     int listen_fd;
     client **clients;   /* indexed by fd */
     int clients_cap;
+    redisDb *db;
 } serverState;
 
 extern serverState server;
