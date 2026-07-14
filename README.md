@@ -22,6 +22,15 @@
 - RDB 스냅샷: fork + COW 활용 - xv6 cow 랩과 개념 연결
 - 벤치: redis-benchmark로 진짜 Redis 대비 수치 - 정직한 비교 공식 적용
 
+## 실행
+
+```bash
+make
+./mini-redis                 # 기본 포트 6380
+./mini-redis --port 7777     # 포트 지정 (-p 7777 도 가능, 1-65535)
+redis-cli -p 6380 PING
+```
+
 ## 확장 (선택)
 
 - AOF 영속화

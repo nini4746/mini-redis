@@ -241,7 +241,7 @@ static int setup_listener(void) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_port = htons(server.port);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(fd); return -1;
@@ -253,7 +253,34 @@ static int setup_listener(void) {
     return fd;
 }
 
-int main(void) {
+/* Parse CLI args. Supports `--port N` / `-p N`; returns 0 on success,
+ * -1 on a malformed/out-of-range value so main can exit non-zero. */
+static int parse_args(int argc, char **argv) {
+    server.port = SERVER_PORT;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s requires a port number\n", argv[i]);
+                return -1;
+            }
+            char *end;
+            long p = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || p < 1 || p > 65535) {
+                fprintf(stderr, "error: invalid port '%s' (1-65535)\n", argv[i]);
+                return -1;
+            }
+            server.port = (int)p;
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", argv[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (parse_args(argc, argv) < 0) return 1;
+
     /* Ignore SIGPIPE so writes to dead sockets return EPIPE instead. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -285,7 +312,7 @@ int main(void) {
 
     kq_change(server.listen_fd, EVFILT_READ, EV_ADD | EV_ENABLE);
 
-    fprintf(stderr, "mini-redis listening on port %d\n", SERVER_PORT);
+    fprintf(stderr, "mini-redis listening on port %d\n", server.port);
 
     server.last_cron = mstime();
 

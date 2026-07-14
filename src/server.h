@@ -10,6 +10,7 @@
 
 typedef struct serverState {
     int kq;
+    int port;           /* listen port; defaults to SERVER_PORT, overridable via --port */
     int listen_fd;
     client **clients;   /* indexed by fd */
     int clients_cap;
