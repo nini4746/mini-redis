@@ -7,7 +7,10 @@ BIN = mini-redis
 $(BIN): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -o $(BIN) $(SRC)
 
+test: $(BIN)
+	bash tests/run.sh
+
 clean:
 	rm -f $(BIN)
 
-.PHONY: clean
+.PHONY: clean test

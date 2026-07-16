@@ -31,6 +31,14 @@ make
 redis-cli -p 6380 PING
 ```
 
+## 테스트
+
+```bash
+make test                    # 실 서버를 격리 포트에 띄우고 redis-cli로 R1~R4 AC 검증 (33 checks)
+```
+
+실제 서버 프로세스를 스폰해 공식 `redis-cli`로 구동하는 end-to-end 테스트다 (`tests/run.sh`). `redis-cli` 필요.
+
 ## 확장 (선택)
 
 - AOF 영속화
