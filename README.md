@@ -1,6 +1,6 @@
 # 미니 Redis
 
-> 토이 5번. 예상 2~3주. 언어: C (kqueue - macOS).
+> 토이 5번. 예상 2~3주. 언어: C (Linux epoll, macOS kqueue).
 
 ## CS 지식
 
@@ -15,7 +15,7 @@
 ## 구성
 
 - RESP 프로토콜 파싱 (실제 redis-cli가 붙는 게 완료 조건)
-- kqueue 기반 단일 스레드 이벤트 루프
+- epoll(Linux)과 kqueue(macOS) 기반 단일 스레드 이벤트 루프
 - 자료구조: string, list, hash, set + GET/SET/DEL/EXPIRE/LPUSH/...
 - TTL: 지연 삭제 + 주기 샘플링 (진짜 Redis 방식)
 - LRU 근사 eviction (maxmemory)
@@ -28,6 +28,7 @@
 make
 ./mini-redis                 # 기본 포트 6380
 ./mini-redis --port 7777     # 포트 지정 (-p 7777 도 가능, 1-65535)
+./mini-redis --appendonly    # AOF 영속화 (appendonly.aof)
 redis-cli -p 6380 PING
 ```
 
@@ -39,8 +40,17 @@ make test                    # 실 서버를 격리 포트에 띄우고 redis-cl
 
 실제 서버 프로세스를 스폰해 공식 `redis-cli`로 구동하는 end-to-end 테스트다 (`tests/run.sh`). `redis-cli` 필요.
 
+## AOF 영속화
+
+`--appendonly`로 켠다. 상태를 바꾸는 명령을 RESP 그대로 기록하고 시작할 때 재실행한다.
+
+- 프로세스가 `kill -9`로 죽어도 유실이 없고, fsync는 1초 주기라 전원 장애 시 최대 약 1초분이 유실될 수 있다.
+- `EXPIRE`는 절대 시각(`PEXPIREAT`)으로 기록해 재시작해도 TTL이 다시 늘어나지 않는다.
+- eviction으로 지운 키는 `DEL`로 기록해 재실행 후 되살아나지 않는다.
+- 쓰다 끊긴 마지막 명령은 잘라내고 경고를 남기며, 그 외 손상은 시작을 거부한다.
+- AOF가 있으면 RDB보다 AOF를 우선한다. AOF rewrite(압축)는 구현하지 않았다.
+
 ## 확장 (선택)
 
-- AOF 영속화
 - pub/sub
 - DNS 리졸버(토이 4번) 캐시 백엔드로 셀프 소비

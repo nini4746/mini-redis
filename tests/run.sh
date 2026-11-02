@@ -117,6 +117,63 @@ check "20 concurrent INCR -> 20"  "20"    "$("${CLI[@]}" GET ctr)"
 pipe=$(printf 'SET p 1\r\nINCR p\r\nGET p\r\n' | nc -w1 127.0.0.1 "$PORT" | tr -d '\r' | grep -c -E '^(OK|:2|\$1|2)$')
 check "pipelined SET/INCR/GET replies present" "3" "$pipe"
 
+echo "== AOF persistence =="
+AOF_PORT=$((PORT + 1))
+AOF_DIR="$WORK/aof"
+mkdir -p "$AOF_DIR"
+ACLI=(redis-cli -p "$AOF_PORT")
+
+start_aof() {
+  ( cd "$AOF_DIR" && exec "$BIN" --port "$AOF_PORT" --appendonly ) >/dev/null 2>"$AOF_DIR/err" &
+  AOF_PID=$!
+  for _ in $(seq 1 50); do
+    [ "$("${ACLI[@]}" PING 2>/dev/null)" = "PONG" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+start_aof || { echo "FATAL: AOF server never became ready"; exit 2; }
+"${ACLI[@]}" SET s hello >/dev/null
+"${ACLI[@]}" SET gone x >/dev/null
+"${ACLI[@]}" DEL gone >/dev/null
+"${ACLI[@]}" RPUSH l a b c >/dev/null
+"${ACLI[@]}" LPOP l >/dev/null
+"${ACLI[@]}" HSET h f v >/dev/null
+"${ACLI[@]}" SADD st m >/dev/null
+"${ACLI[@]}" INCR n >/dev/null
+"${ACLI[@]}" INCR n >/dev/null
+"${ACLI[@]}" SET ttl v >/dev/null
+"${ACLI[@]}" EXPIRE ttl 100 >/dev/null
+"${ACLI[@]}" SET short v >/dev/null
+"${ACLI[@]}" EXPIRE short 1 >/dev/null
+sleep 1.2
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+sleep 0.2
+start_aof || { echo "FATAL: AOF restart failed"; exit 2; }
+check "AOF: string survives kill -9"  "hello" "$("${ACLI[@]}" GET s)"
+check "AOF: deleted key stays deleted" "0"    "$("${ACLI[@]}" EXISTS gone)"
+check "AOF: list state replayed"      "2"     "$("${ACLI[@]}" LLEN l)"
+check "AOF: hash replayed"            "v"     "$("${ACLI[@]}" HGET h f)"
+check "AOF: set replayed"             "1"     "$("${ACLI[@]}" SISMEMBER st m)"
+check "AOF: counter replayed"         "2"     "$("${ACLI[@]}" GET n)"
+ttl_left=$("${ACLI[@]}" TTL ttl)
+check "AOF: TTL kept, not restarted"  "1"     "$([ "$ttl_left" -gt 0 ] && [ "$ttl_left" -le 100 ] && echo 1)"
+check "AOF: expired key not revived"  "0"     "$("${ACLI[@]}" EXISTS short)"
+
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+size_before=$(wc -c < "$AOF_DIR/appendonly.aof" | tr -d ' ')
+printf '*2\r\n$3\r\nGET\r\n$5\r\nhe' >> "$AOF_DIR/appendonly.aof"
+start_aof || { echo "FATAL: AOF restart with partial tail failed"; exit 2; }
+check "AOF: partial tail cut, data kept" "hello" "$("${ACLI[@]}" GET s)"
+check "AOF: file cut back to last command" "$size_before" "$(wc -c < "$AOF_DIR/appendonly.aof" | tr -d ' ')"
+
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+printf 'not a resp command\r\n' >> "$AOF_DIR/appendonly.aof"
+( cd "$AOF_DIR" && exec "$BIN" --port "$AOF_PORT" --appendonly ) >/dev/null 2>"$AOF_DIR/err"
+check "AOF: corrupt file refuses to start" "1" "$?"
+check "AOF: corruption reported" "1" "$(grep -c 'corrupt' "$AOF_DIR/err")"
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

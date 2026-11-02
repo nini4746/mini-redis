@@ -1,3 +1,4 @@
 mini-redis
 *.o
 dump.mrdb
+appendonly.aof

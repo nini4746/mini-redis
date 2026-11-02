@@ -1,6 +1,11 @@
 #include "zmalloc.h"
 
+#ifdef __linux__
+#include <malloc.h>
+#define malloc_size malloc_usable_size
+#else
 #include <malloc/malloc.h> /* malloc_size on macOS */
+#endif
 #include <stdlib.h>
 
 static size_t used_memory = 0;

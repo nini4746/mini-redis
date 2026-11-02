@@ -5,6 +5,8 @@
 #include "dict.h"
 #include "util.h"
 #include "rdb.h"
+#include "poller.h"
+#include "aof.h"
 
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -15,7 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -38,26 +39,19 @@ static void clients_ensure(int fd) {
     server.clients_cap = cap;
 }
 
-static void kq_change(int fd, int16_t filter, uint16_t flags) {
-    struct kevent ev;
-    EV_SET(&ev, fd, filter, flags, 0, 0, NULL);
-    kevent(server.kq, &ev, 1, NULL, 0, NULL);
-}
-
 void el_set_write(client *c, int enable) {
     if (enable && !c->write_blocked) {
-        kq_change(c->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE);
+        poller_set_write(server.poller, c->fd, 1);
         c->write_blocked = 1;
     } else if (!enable && c->write_blocked) {
-        kq_change(c->fd, EVFILT_WRITE, EV_DELETE);
+        poller_set_write(server.poller, c->fd, 0);
         c->write_blocked = 0;
     }
 }
 
 static void close_client(client *c) {
     int fd = c->fd;
-    kq_change(fd, EVFILT_READ, EV_DELETE);
-    if (c->write_blocked) kq_change(fd, EVFILT_WRITE, EV_DELETE);
+    poller_del(server.poller, fd, c->write_blocked);
     server.clients[fd] = NULL;
     client_free(c); /* also closes fd */
 }
@@ -152,7 +146,7 @@ static void accept_clients(void) {
         client *c = client_new(fd);
         if (!c) { close(fd); continue; }
         server.clients[fd] = c;
-        kq_change(fd, EVFILT_READ, EV_ADD | EV_ENABLE);
+        poller_add(server.poller, fd);
     }
 }
 
@@ -199,7 +193,7 @@ int server_start_bgsave(void) {
         /* Child: drop all inherited sockets so it can never answer a client,
          * then dump the fork-time snapshot (COW) and exit. */
         close(server.listen_fd);
-        close(server.kq);
+        close(server.poller);
         for (int fd = 0; fd < server.clients_cap; fd++)
             if (server.clients[fd]) close(fd);
         int ok = (rdb_save(server.db, server.rdb_filename) == 0);
@@ -229,6 +223,7 @@ static void server_cron(void) {
     if (now - server.last_cron < 100) return; /* ~10Hz */
     server.last_cron = now;
     active_expire_cycle();
+    aof_fsync_if_due(now);
 }
 
 static int setup_listener(void) {
@@ -254,7 +249,8 @@ static int setup_listener(void) {
 }
 
 /* Parse CLI args. Supports `--port N` / `-p N`; returns 0 on success,
- * -1 on a malformed/out-of-range value so main can exit non-zero. */
+ * -1 on a malformed/out-of-range value so main can exit non-zero.
+ * `--appendonly` turns on AOF persistence. */
 static int parse_args(int argc, char **argv) {
     server.port = SERVER_PORT;
     for (int i = 1; i < argc; i++) {
@@ -270,6 +266,8 @@ static int parse_args(int argc, char **argv) {
                 return -1;
             }
             server.port = (int)p;
+        } else if (strcmp(argv[i], "--appendonly") == 0) {
+            server.aof_enabled = 1;
         } else {
             fprintf(stderr, "error: unknown argument '%s'\n", argv[i]);
             return -1;
@@ -293,52 +291,68 @@ int main(int argc, char **argv) {
 
     /* Load a snapshot if present. A corrupt file is fatal (we refuse to
      * start rather than silently mask data loss with an empty DB). */
-    int lr = rdb_load(server.db, server.rdb_filename);
-    if (lr == RDB_ERR) {
-        fprintf(stderr,
-                "FATAL: RDB file '%s' is corrupt or truncated; refusing to start\n",
-                server.rdb_filename);
-        return 1;
+    server.aof_fd = -1;
+    server.aof_filename = "appendonly.aof";
+    int aof_state = AOF_MISSING;
+    if (server.aof_enabled) {
+        aof_state = aof_load(server.aof_filename);
+        if (aof_state == AOF_ERR) {
+            fprintf(stderr, "FATAL: AOF file '%s' is corrupt; refusing to start\n",
+                    server.aof_filename);
+            return 1;
+        }
+        if (aof_state == AOF_OK)
+            fprintf(stderr, "Loaded %zu keys from %s\n",
+                    db_size(server.db), server.aof_filename);
     }
-    if (lr == RDB_OK)
-        fprintf(stderr, "Loaded %zu keys from %s\n",
-                db_size(server.db), server.rdb_filename);
+    /* The AOF holds the full history once it exists; replaying the snapshot
+     * on top of it would resurrect deleted keys. */
+    if (aof_state == AOF_MISSING) {
+        int lr = rdb_load(server.db, server.rdb_filename);
+        if (lr == RDB_ERR) {
+            fprintf(stderr,
+                    "FATAL: RDB file '%s' is corrupt or truncated; refusing to start\n",
+                    server.rdb_filename);
+            return 1;
+        }
+        if (lr == RDB_OK)
+            fprintf(stderr, "Loaded %zu keys from %s\n",
+                    db_size(server.db), server.rdb_filename);
+    }
+    if (server.aof_enabled && aof_open(server.aof_filename) != AOF_OK) return 1;
 
     server.listen_fd = setup_listener();
     if (server.listen_fd < 0) return 1;
 
-    server.kq = kqueue();
-    if (server.kq < 0) { perror("kqueue"); return 1; }
+    server.poller = poller_create();
+    if (server.poller < 0) { perror("poller"); return 1; }
 
-    kq_change(server.listen_fd, EVFILT_READ, EV_ADD | EV_ENABLE);
+    poller_add(server.poller, server.listen_fd);
 
     fprintf(stderr, "mini-redis listening on port %d\n", server.port);
 
     server.last_cron = mstime();
 
-    struct kevent events[256];
-    struct timespec ts = { 0, 100 * 1000 * 1000 }; /* 100ms tick */
+    pollerEvent events[256];
     for (;;) {
-        int n = kevent(server.kq, NULL, 0, events, 256, &ts);
+        int n = poller_wait(server.poller, events, 256, 100); /* 100ms tick */
         if (n < 0) {
             if (errno == EINTR) { server_cron(); continue; }
-            perror("kevent");
+            perror("poller_wait");
             break;
         }
         server_cron();
         for (int i = 0; i < n; i++) {
-            int fd = (int)events[i].ident;
+            int fd = events[i].fd;
             if (fd == server.listen_fd) {
                 accept_clients();
                 continue;
             }
             client *c = (fd < server.clients_cap) ? server.clients[fd] : NULL;
-            if (!c) continue;
-            if (events[i].filter == EVFILT_READ) {
-                read_from_client(c);
-            } else if (events[i].filter == EVFILT_WRITE) {
-                if (flush_write(c) < 0) close_client(c);
-            }
+            if (c && events[i].readable) read_from_client(c);
+            /* One epoll event can carry both flags and the read may close. */
+            c = (fd < server.clients_cap) ? server.clients[fd] : NULL;
+            if (c && events[i].writable && flush_write(c) < 0) close_client(c);
         }
     }
     return 0;

@@ -7,6 +7,7 @@
 #include "dict.h"
 #include "util.h"
 #include "rdb.h"
+#include "aof.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -32,6 +33,7 @@ typedef struct command {
     cmd_handler handler;
     int arity;      /* exact arg count, or negative for "at least -arity" */
     int deny_oom;   /* command grows memory -> subject to eviction/OOM check */
+    int log_aof;    /* command changes state -> appended to the AOF */
 } command;
 
 /* ---- handlers ---- */
@@ -358,6 +360,30 @@ static void scard_cmd(client *c) {
 
 /* ---- TTL ---- */
 
+/* EXPIRE is relative, so replaying it would restart the TTL. Log the
+ * absolute deadline instead. */
+static void aof_log_deadline(client *c, long long when) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%lld", when);
+    const char *argv[] = { "PEXPIREAT", c->argv[1].data, buf };
+    const size_t lens[] = { 9, c->argv[1].len, (size_t)n };
+    if (!server.aof_loading) aof_append_cstr(3, argv, lens);
+}
+
+static void pexpireat_cmd(client *c) {
+    char *end;
+    long long when = strtoll(c->argv[2].data, &end, 10);
+    if (*end) { reply_error(c, "ERR value is not an integer or out of range"); return; }
+
+    robj *o = db_lookup(server.db, c->argv[1].data, c->argv[1].len);
+    if (!o) { reply_integer(c, 0); return; }
+    if (when <= mstime())
+        db_delete(server.db, c->argv[1].data, c->argv[1].len);
+    else
+        db_set_expire(server.db, c->argv[1].data, c->argv[1].len, when);
+    reply_integer(c, 1);
+}
+
 static void expire_cmd(client *c) {
     char *end;
     long long secs = strtoll(c->argv[2].data, &end, 10);
@@ -369,11 +395,13 @@ static void expire_cmd(client *c) {
     if (secs <= 0) {
         /* Non-positive expire deletes the key immediately. */
         db_delete(server.db, c->argv[1].data, c->argv[1].len);
+        aof_log_deadline(c, 0);
         reply_integer(c, 1);
         return;
     }
-    db_set_expire(server.db, c->argv[1].data, c->argv[1].len,
-                  mstime() + secs * 1000);
+    long long when = mstime() + secs * 1000;
+    db_set_expire(server.db, c->argv[1].data, c->argv[1].len, when);
+    aof_log_deadline(c, when);
     reply_integer(c, 1);
 }
 
@@ -448,36 +476,37 @@ static void bgsave_cmd(client *c) {
 /* ---- table ---- */
 
 static const command command_table[] = {
-    {"PING", ping_cmd, -1, 0},
-    {"ECHO", echo_cmd, 2, 0},
-    {"GET", get_cmd, 2, 0},
-    {"SET", set_cmd, 3, 1},
-    {"DEL", del_cmd, -2, 0},
-    {"EXISTS", exists_cmd, -2, 0},
-    {"INCR", incr_cmd, 2, 1},
-    {"DBSIZE", dbsize_cmd, 1, 0},
-    {"FLUSHALL", flushall_cmd, 1, 0},
-    {"LPUSH", lpush_cmd, -3, 1},
-    {"RPUSH", rpush_cmd, -3, 1},
-    {"LPOP", lpop_cmd, 2, 0},
-    {"RPOP", rpop_cmd, 2, 0},
-    {"LRANGE", lrange_cmd, 4, 0},
-    {"LLEN", llen_cmd, 2, 0},
-    {"HSET", hset_cmd, -4, 1},
-    {"HGET", hget_cmd, 3, 0},
-    {"HDEL", hdel_cmd, -3, 0},
-    {"HGETALL", hgetall_cmd, 2, 0},
-    {"SADD", sadd_cmd, -3, 1},
-    {"SREM", srem_cmd, -3, 0},
-    {"SISMEMBER", sismember_cmd, 3, 0},
-    {"SMEMBERS", smembers_cmd, 2, 0},
-    {"SCARD", scard_cmd, 2, 0},
-    {"EXPIRE", expire_cmd, 3, 0},
-    {"TTL", ttl_cmd, 2, 0},
-    {"PERSIST", persist_cmd, 2, 0},
-    {"CONFIG", config_cmd, -2, 0},
-    {"SAVE", save_cmd, 1, 0},
-    {"BGSAVE", bgsave_cmd, -1, 0},
+    {"PING", ping_cmd, -1, 0, 0},
+    {"ECHO", echo_cmd, 2, 0, 0},
+    {"GET", get_cmd, 2, 0, 0},
+    {"SET", set_cmd, 3, 1, 1},
+    {"DEL", del_cmd, -2, 0, 1},
+    {"EXISTS", exists_cmd, -2, 0, 0},
+    {"INCR", incr_cmd, 2, 1, 1},
+    {"DBSIZE", dbsize_cmd, 1, 0, 0},
+    {"FLUSHALL", flushall_cmd, 1, 0, 1},
+    {"LPUSH", lpush_cmd, -3, 1, 1},
+    {"RPUSH", rpush_cmd, -3, 1, 1},
+    {"LPOP", lpop_cmd, 2, 0, 1},
+    {"RPOP", rpop_cmd, 2, 0, 1},
+    {"LRANGE", lrange_cmd, 4, 0, 0},
+    {"LLEN", llen_cmd, 2, 0, 0},
+    {"HSET", hset_cmd, -4, 1, 1},
+    {"HGET", hget_cmd, 3, 0, 0},
+    {"HDEL", hdel_cmd, -3, 0, 1},
+    {"HGETALL", hgetall_cmd, 2, 0, 0},
+    {"SADD", sadd_cmd, -3, 1, 1},
+    {"SREM", srem_cmd, -3, 0, 1},
+    {"SISMEMBER", sismember_cmd, 3, 0, 0},
+    {"SMEMBERS", smembers_cmd, 2, 0, 0},
+    {"SCARD", scard_cmd, 2, 0, 0},
+    {"EXPIRE", expire_cmd, 3, 0, 0},
+    {"TTL", ttl_cmd, 2, 0, 0},
+    {"PERSIST", persist_cmd, 2, 0, 1},
+    {"PEXPIREAT", pexpireat_cmd, 3, 0, 1},
+    {"CONFIG", config_cmd, -2, 0, 0},
+    {"SAVE", save_cmd, 1, 0, 0},
+    {"BGSAVE", bgsave_cmd, -1, 0, 0},
 };
 
 static const command *lookup_command(const char *name, size_t len) {
@@ -522,6 +551,10 @@ static int evict_until(long long target) {
         char *k = zmalloc(kl ? kl : 1);
         memcpy(k, best->key, kl);
         db_delete(db, k, kl);
+        /* Log evictions, or a replay would bring these keys back. */
+        const char *del_argv[] = { "DEL", k };
+        const size_t del_lens[] = { 3, kl };
+        if (!server.aof_loading) aof_append_cstr(2, del_argv, del_lens);
         zfree(k);
     }
     return 1;
@@ -560,5 +593,6 @@ void command_dispatch(client *c) {
         return;
     }
     if (check_oom(c, cmd) != 0) return;
+    if (cmd->log_aof && !server.aof_loading) aof_append(c->argc, c->argv);
     cmd->handler(c);
 }

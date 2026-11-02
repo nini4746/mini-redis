@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -std=c11 -Wall -Wextra -O2
+CFLAGS = -std=gnu11 -Wall -Wextra -O2
 SRC = $(wildcard src/*.c)
 HDR = $(wildcard src/*.h)
 BIN = mini-redis
