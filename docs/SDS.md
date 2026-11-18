@@ -290,7 +290,8 @@ flowchart TD
 
 | 무엇이 기록되나 | 기록 형태 | 위치 |
 |-----------------|-----------|------|
-| `log_aof`가 1인 명령 | 받은 argv 그대로 | `command_dispatch` (arity, OOM 검사 통과 후, 핸들러 실행 전) |
+| `log_aof`가 1인 명령 | 받은 argv 그대로 | `command_dispatch` (arity, OOM 검사 통과 후, 핸들러 실행 후. 응답이 `-`로 시작하면 기록하지 않음) |
+| AOF를 처음 만들 때 RDB에서 로드한 키 | `SET`, 요소마다 `RPUSH`/`HSET`/`SADD`, TTL이 있으면 `PEXPIREAT key <절대 ms>` | `main` (`aof_write_keyspace`) |
 | `EXPIRE key secs` (키가 있을 때) | `PEXPIREAT key <절대 ms>`. secs가 0 이하면 `PEXPIREAT key 0` | `expire_cmd` (`aof_log_deadline`) |
 | eviction으로 지운 키 | `DEL key` | `evict_until` |
 | 재실행 중 실행한 명령 | 기록하지 않음 (`aof_loading`) | `command_dispatch`, `aof_log_deadline`, `evict_until` |
@@ -437,6 +438,8 @@ sequenceDiagram
     X->>E: check_oom
     alt maxmemory 0 또는 deny_oom 아님
         E-->>X: 진행
+    else incoming > maxmemory
+        E-->>C: -OOM command not allowed (evict 없음)
     else maxmemory 설정됨
         loop used > maxmemory - incoming, 키가 남은 동안
             E->>D: 무작위 5개 중 lru 최소 키 삭제
@@ -621,6 +624,7 @@ start = now
 ```
 if deny_oom 아님 또는 maxmemory <= 0: 진행
 incoming = sum(argv[2..] 길이 + 64)
+if incoming > maxmemory: evict 없이 -OOM 응답
 while used_memory > maxmemory - incoming:
     키스페이스에서 dict_random 5번, lru가 가장 작은 키 선택
     키가 하나도 없으면 중단
@@ -782,7 +786,7 @@ server_cron (약 100ms마다):
 | `CONFIG SET` 다른 파라미터 | 무시하고 `+OK` |
 | `CONFIG SET maxmemory` 값 형식 오류 | `-ERR Invalid argument for CONFIG SET 'maxmemory'` |
 | `CONFIG` 다른 서브명령 | `-ERR Unknown CONFIG subcommand or wrong number of arguments` |
-| 쓰기 하나의 예상 크기가 maxmemory보다 큼 | 키스페이스가 빌 때까지 evict한 뒤 `-OOM`. 서버는 계속 동작 |
+| 쓰기 하나의 예상 크기가 maxmemory보다 큼 | evict하지 않고 바로 `-OOM`. 기존 키는 그대로 남고 서버는 계속 동작 |
 | 새로 쓴 뒤 아직 조회하지 않은 키 | `lru`가 0이라 eviction 후보로 가장 먼저 고려된다 |
 | `SAVE` 실패 (파일 열기, 쓰기, rename 오류) | 임시 파일 삭제, `-ERR error saving DB on disk` |
 | `BGSAVE` 진행 중 다시 `BGSAVE` | `-ERR Background save already in progress` |
@@ -798,12 +802,12 @@ server_cron (약 100ms마다):
 | 끊긴 소켓에 `write()` | `SIGPIPE`를 무시하므로 오류 반환, 연결 종료 |
 | `read`/`write`/`accept`의 `EINTR` | 다시 시도 |
 | `poller_wait`의 `EINTR` | 주기 작업 후 루프 계속. 다른 오류면 `perror("poller_wait")` 후 루프 종료 |
-| `--appendonly`인데 `appendonly.aof` 없음 | `dump.mrdb`가 있으면 로드하고, 빈 AOF 파일을 만든 뒤 기동 |
+| `--appendonly`인데 `appendonly.aof` 없음 | `dump.mrdb`가 있으면 로드하고, AOF 파일을 만든 뒤 로드한 키스페이스를 명령으로 써 두고(TTL은 `PEXPIREAT`) 기동. 로드한 키가 없으면 빈 파일 |
 | `appendonly.aof` 끝에 쓰다 끊긴 명령 | `WARNING: cutting N bytes ...` 후 마지막 온전한 명령 끝까지 `truncate`. 그 앞 데이터는 유지 |
 | `appendonly.aof`의 명령이 `*`로 시작하지 않음, RESP 오류 | FATAL 로그 후 종료 코드 1 |
 | AOF 재실행 중 명령이 `-ERR`로 시작하는 응답을 냄 | 손상으로 보고 FATAL 로그 후 종료 코드 1 |
-| 핸들러가 `-ERR`로 거부한 `log_aof` 명령 (예: 정수가 아닌 값에 `INCR`) | 기록이 핸들러 실행 전이라 AOF에 남는다. 재시작 시 재실행이 다시 `-ERR`을 내 손상으로 판정되어 기동을 거부한다. `SET s abc`, `INCR s` 후 재시작으로 재현 (`FATAL: AOF file 'appendonly.aof' is corrupt; refusing to start`, 종료 코드 1). `-WRONGTYPE` 응답은 `-ERR`이 아니라 이 판정에 걸리지 않는다 |
-| `dump.mrdb`만 있던 디렉터리에서 처음 `--appendonly`로 기동 | 첫 기동은 AOF가 없어 `dump.mrdb`를 로드하고 빈 `appendonly.aof`를 만든다. 다음 기동부터는 AOF가 있어 `dump.mrdb`를 읽지 않으므로, 그 사이 다시 쓰지 않은 스냅샷 키는 사라진다. `SET fromrdb 1`, `SAVE` 후 `--appendonly`로 두 번 기동해 재현 (두 번째 기동에서 `Loaded 0 keys from appendonly.aof`, `GET fromrdb`는 nil) |
+| 핸들러가 오류(`-ERR`, `-WRONGTYPE`)로 거부한 `log_aof` 명령 (예: 정수가 아닌 값에 `INCR`) | AOF에 기록하지 않는다. 기록은 핸들러 실행 후이고, 응답이 `-`로 시작하면 건너뛴다. 재시작해도 정상 기동한다 |
+| `dump.mrdb`만 있던 디렉터리에서 처음 `--appendonly`로 기동 | 첫 기동은 AOF가 없어 `dump.mrdb`를 로드하고, 새 `appendonly.aof`에 그 키스페이스를 써 둔 뒤 바로 fsync한다. 다음 기동부터 AOF만 읽어도 스냅샷 키와 TTL이 유지된다 |
 | AOF `write()` 실패 (`EINTR` 제외) | `FATAL: AOF write failed` 후 종료 코드 1 |
 | AOF `fsync()` 실패 | `perror` 로그만 남기고 계속 |
 | eviction으로 키 삭제 (`--appendonly`) | `DEL key` 기록. 재실행 중 eviction은 기록하지 않음 |

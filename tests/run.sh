@@ -117,6 +117,16 @@ check "20 concurrent INCR -> 20"  "20"    "$("${CLI[@]}" GET ctr)"
 pipe=$(printf 'SET p 1\r\nINCR p\r\nGET p\r\n' | nc -w1 127.0.0.1 "$PORT" | tr -d '\r' | grep -c -E '^(OK|:2|\$1|2)$')
 check "pipelined SET/INCR/GET replies present" "3" "$pipe"
 
+echo "== maxmemory =="
+# A value bigger than maxmemory can never fit: -OOM without evicting (#1).
+keys_before=$("${CLI[@]}" DBSIZE)
+head -c 300000 /dev/zero | tr '\0' 'x' > "$WORK/huge.txt"
+"${CLI[@]}" CONFIG SET maxmemory 200000 >/dev/null
+check "SET > maxmemory -> OOM"    "1" \
+      "$("${CLI[@]}" -x SET huge < "$WORK/huge.txt" 2>&1 | grep -c 'OOM')"
+check "oversized SET evicts nothing" "$keys_before" "$("${CLI[@]}" DBSIZE)"
+"${CLI[@]}" CONFIG SET maxmemory 0 >/dev/null
+
 echo "== AOF persistence =="
 AOF_PORT=$((PORT + 1))
 AOF_DIR="$WORK/aof"
@@ -173,6 +183,44 @@ printf 'not a resp command\r\n' >> "$AOF_DIR/appendonly.aof"
 ( cd "$AOF_DIR" && exec "$BIN" --port "$AOF_PORT" --appendonly ) >/dev/null 2>"$AOF_DIR/err"
 check "AOF: corrupt file refuses to start" "1" "$?"
 check "AOF: corruption reported" "1" "$(grep -c 'corrupt' "$AOF_DIR/err")"
+
+# A write the handler rejects must not reach the log (#2).
+AOF_DIR="$WORK/aof-rejected"
+mkdir -p "$AOF_DIR"
+start_aof || { echo "FATAL: AOF server never became ready"; exit 2; }
+"${ACLI[@]}" SET s abc >/dev/null
+"${ACLI[@]}" INCR s >/dev/null 2>&1
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+start_aof
+check "AOF: rejected write not logged, restart ok" "abc" "$("${ACLI[@]}" GET s 2>/dev/null)"
+kill -9 "$AOF_PID" 2>/dev/null; wait "$AOF_PID" 2>/dev/null
+
+# Turning AOF on over an existing snapshot keeps the snapshot keys (#3).
+AOF_DIR="$WORK/aof-from-rdb"
+mkdir -p "$AOF_DIR"
+( cd "$AOF_DIR" && exec "$BIN" --port "$AOF_PORT" ) >/dev/null 2>"$AOF_DIR/err" &
+AOF_PID=$!
+for _ in $(seq 1 50); do
+  [ "$("${ACLI[@]}" PING 2>/dev/null)" = "PONG" ] && break
+  sleep 0.1
+done
+"${ACLI[@]}" SET fromrdb 1 >/dev/null
+"${ACLI[@]}" RPUSH rl a b >/dev/null
+"${ACLI[@]}" HSET rh f v >/dev/null
+"${ACLI[@]}" SADD rs m >/dev/null
+"${ACLI[@]}" SET rttl v >/dev/null
+"${ACLI[@]}" EXPIRE rttl 100 >/dev/null
+"${ACLI[@]}" SAVE >/dev/null
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+start_aof || { echo "FATAL: AOF start over RDB failed"; exit 2; }
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
+start_aof || { echo "FATAL: AOF second start over RDB failed"; exit 2; }
+check "AOF over RDB: string kept on 2nd start" "1" "$("${ACLI[@]}" GET fromrdb)"
+check "AOF over RDB: list/hash/set kept" $'a\nb\nv\n1' \
+      "$("${ACLI[@]}" LRANGE rl 0 -1; "${ACLI[@]}" HGET rh f; "${ACLI[@]}" SISMEMBER rs m)"
+ttl_left=$("${ACLI[@]}" TTL rttl)
+check "AOF over RDB: TTL kept"    "1"     "$([ "$ttl_left" -gt 0 ] && [ "$ttl_left" -le 100 ] && echo 1)"
+kill -9 "$AOF_PID"; wait "$AOF_PID" 2>/dev/null
 
 echo
 echo "== $PASS passed, $FAIL failed =="
