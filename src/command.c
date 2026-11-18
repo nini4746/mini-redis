@@ -565,7 +565,9 @@ static int evict_until(long long target) {
 static int check_oom(client *c, const command *cmd) {
     if (!cmd->deny_oom || server.maxmemory <= 0) return 0; /* eviction off */
     long long incoming = incoming_bytes(c);
-    evict_until(server.maxmemory - incoming);
+    /* Bigger than the whole limit: no eviction can make it fit, so don't
+     * empty the keyspace before refusing. */
+    if (incoming <= server.maxmemory) evict_until(server.maxmemory - incoming);
     if ((long long)zmalloc_used() + incoming > server.maxmemory) {
         reply_error(c,
             "OOM command not allowed when used memory > 'maxmemory'");
@@ -593,6 +595,10 @@ void command_dispatch(client *c) {
         return;
     }
     if (check_oom(c, cmd) != 0) return;
-    if (cmd->log_aof && !server.aof_loading) aof_append(c->argc, c->argv);
+    size_t reply_at = c->wlen;
     cmd->handler(c);
+    /* Log only writes the handler accepted: a rejected one (-ERR,
+     * -WRONGTYPE) changed nothing, and replaying it would fail. */
+    int rejected = c->wlen > reply_at && c->wbuf[reply_at] == '-';
+    if (cmd->log_aof && !server.aof_loading && !rejected) aof_append(c->argc, c->argv);
 }
