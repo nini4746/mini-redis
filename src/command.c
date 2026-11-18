@@ -532,6 +532,32 @@ static long long incoming_bytes(client *c) {
     return s;
 }
 
+/* Memory held by this client's own buffers (read/write buffers and the
+ * parsed argv). It is counted in zmalloc_used() but eviction cannot free it,
+ * so it must not count against the keyspace budget (#4). */
+static long long client_buffer_bytes(client *c) {
+    long long s = (long long)zmalloc_size(c->rbuf) + (long long)zmalloc_size(c->wbuf);
+    for (int i = 0; i < c->argc; i++) s += (long long)zmalloc_size(c->argv[i].data);
+    return s;
+}
+
+/* Memory no eviction can free: the empty-keyspace baseline taken at startup,
+ * the keyspace hash tables (they never shrink), and every connected client
+ * (struct, argv array, buffers). If a write would
+ * not fit even on top of this, emptying the keyspace cannot help (#4). */
+static long long non_evictable_bytes(void) {
+    long long s = server.base_memory + (long long)zmalloc_size(server.clients)
+                + (long long)zmalloc_size(server.db->dict->table)
+                + (long long)zmalloc_size(server.db->expires->table);
+    for (int fd = 0; fd < server.clients_cap; fd++) {
+        client *o = server.clients[fd];
+        if (!o) continue;
+        s += (long long)zmalloc_size(o) + (long long)zmalloc_size(o->argv);
+        s += client_buffer_bytes(o);
+    }
+    return s;
+}
+
 /* Approximate allkeys-LRU: evict keys (sampling 5, dropping the least
  * recently accessed) until used memory drops to target. Returns 1 if the
  * target was reached, 0 if the keyspace ran empty first. */
@@ -565,10 +591,15 @@ static int evict_until(long long target) {
 static int check_oom(client *c, const command *cmd) {
     if (!cmd->deny_oom || server.maxmemory <= 0) return 0; /* eviction off */
     long long incoming = incoming_bytes(c);
-    /* Bigger than the whole limit: no eviction can make it fit, so don't
-     * empty the keyspace before refusing. */
-    if (incoming <= server.maxmemory) evict_until(server.maxmemory - incoming);
-    if ((long long)zmalloc_used() + incoming > server.maxmemory) {
+    /* The request's own buffers are transient and not evictable: leave them
+     * out of the budget, or a value well under maxmemory empties the
+     * keyspace chasing a target it can never reach (#4). */
+    long long budget = server.maxmemory + client_buffer_bytes(c);
+    /* If it would not fit even with the keyspace empty, no eviction can help:
+     * refuse without evicting anything (#1, #4). */
+    if (non_evictable_bytes() + incoming <= budget)
+        evict_until(budget - incoming);
+    if ((long long)zmalloc_used() + incoming > budget) {
         reply_error(c,
             "OOM command not allowed when used memory > 'maxmemory'");
         return -1;

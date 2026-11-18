@@ -286,6 +286,11 @@ int main(int argc, char **argv) {
     sigaction(SIGPIPE, &sa, NULL);
 
     server.db = db_create();
+    /* Baseline without the hash tables: they never shrink, so their current
+     * size is added back when the floor is computed. */
+    server.base_memory = (long long)zmalloc_used()
+                       - (long long)zmalloc_size(server.db->dict->table)
+                       - (long long)zmalloc_size(server.db->expires->table);
     server.rdb_child_pid = -1;
     server.rdb_filename = "dump.mrdb";
 

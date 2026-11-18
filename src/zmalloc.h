@@ -14,4 +14,7 @@ void zfree(void *ptr);
 /* Approximate live bytes currently allocated. */
 size_t zmalloc_used(void);
 
+/* Bytes zmalloc_used() counts for one live allocation (0 for NULL). */
+size_t zmalloc_size(void *ptr);
+
 #endif

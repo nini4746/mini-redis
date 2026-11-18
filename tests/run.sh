@@ -126,6 +126,21 @@ check "SET > maxmemory -> OOM"    "1" \
       "$("${CLI[@]}" -x SET huge < "$WORK/huge.txt" 2>&1 | grep -c 'OOM')"
 check "oversized SET evicts nothing" "$keys_before" "$("${CLI[@]}" DBSIZE)"
 "${CLI[@]}" CONFIG SET maxmemory 0 >/dev/null
+# A value well under maxmemory: the request's own read buffer and argv copy
+# must not drive eviction until the keyspace is empty (#4).
+"${CLI[@]}" FLUSHALL >/dev/null
+for i in $(seq 1 50); do "${CLI[@]}" SET "mk$i" "v$i" >/dev/null; done
+head -c 300000 /dev/zero | tr '\0' 'x' > "$WORK/mid.txt"
+"${CLI[@]}" CONFIG SET maxmemory 1000000 >/dev/null
+check "SET 30% of maxmemory -> OK" "OK" "$("${CLI[@]}" -x SET mid < "$WORK/mid.txt")"
+check "SET 30% of maxmemory keeps keyspace" "51" "$("${CLI[@]}" DBSIZE)"
+# Just under maxmemory but cannot fit even with the keyspace empty:
+# refuse without evicting.
+head -c 999000 /dev/zero | tr '\0' 'x' > "$WORK/edge.txt"
+check "SET just under maxmemory -> OOM" "1" \
+      "$("${CLI[@]}" -x SET edge < "$WORK/edge.txt" 2>&1 | grep -c 'OOM')"
+check "unfittable SET evicts nothing" "51" "$("${CLI[@]}" DBSIZE)"
+"${CLI[@]}" CONFIG SET maxmemory 0 >/dev/null
 
 echo "== AOF persistence =="
 AOF_PORT=$((PORT + 1))

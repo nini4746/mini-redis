@@ -16,6 +16,7 @@ typedef struct serverState {
     int clients_cap;
     redisDb *db;
     long long maxmemory;   /* 0 = unlimited (eviction disabled) */
+    long long base_memory; /* zmalloc_used() with an empty keyspace minus its hash tables, set at startup */
     long long last_cron;   /* ms timestamp of last periodic tick */
     pid_t rdb_child_pid;   /* -1 when no BGSAVE in flight */
     const char *rdb_filename;

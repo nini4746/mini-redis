@@ -41,3 +41,7 @@ void zfree(void *ptr) {
 size_t zmalloc_used(void) {
     return used_memory;
 }
+
+size_t zmalloc_size(void *ptr) {
+    return ptr ? malloc_size(ptr) : 0;
+}
