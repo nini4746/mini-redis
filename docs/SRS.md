@@ -340,7 +340,7 @@ flowchart LR
 
 | 방법 | 도구 | 다루는 것 | 실행 |
 |------|------|-----------|------|
-| 시험 | `tests/run.sh` | 실제 서버를 빈 임시 디렉터리와 포트 6399(`MINIREDIS_TEST_PORT`로 변경)에 띄우고 공식 `redis-cli`와 `nc`로 응답을 검사한다. 프로토콜(inline 포함), string, list/hash/set, TTL, 동시 접속 20개, 파이프라이닝, AOF 재실행과 손상 처리(포트 +1에 `--appendonly` 서버를 따로 띄움). 현재 결과 51 passed, 0 failed (Linux 컨테이너에서 실행. 2026-11-18 macOS Darwin 27.0.0에서도 51 passed, 0 failed) | `make test` |
+| 시험 | `tests/run.sh` | 실제 서버를 빈 임시 디렉터리와 포트 6399(`MINIREDIS_TEST_PORT`로 변경)에 띄우고 공식 `redis-cli`와 `nc`로 응답을 검사한다. 프로토콜(inline 포함), string, list/hash/set, TTL, 동시 접속 20개, 파이프라이닝, AOF 재실행과 손상 처리(포트 +1에 `--appendonly` 서버를 따로 띄움). 현재 결과 55 passed, 0 failed (Linux 컨테이너에서 실행. 2026-11-18 macOS Darwin 27.0.0에서도 55 passed, 0 failed) | `make test` |
 | 시험 (CI) | `.github/workflows/ci.yml` | push와 pull request마다 `ubuntu-latest`, `macos-latest`에서 `make test`. 실행 기록은 저장소에 없다 | GitHub Actions |
 | 시연 | `bench/run_bench.sh` | mini-redis(6380)와 진짜 Redis(6379, 영속화 OFF)를 같은 `redis-benchmark` 옵션으로 측정한다 | `bash bench/run_bench.sh` |
 | 시연 | `bench/loadgen.py` | `redis-benchmark`가 없을 때 mini-redis 단독 부하를 걸어 완주 여부와 처리량을 본다. 비교 근거로는 쓰지 않는다 | `python3 bench/loadgen.py` |
@@ -411,8 +411,8 @@ FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미�
 | FR-8.8 | 손상 시 기동 거부 | `src/aof.c` (`aof_load`), `src/server.c` (`main`) | `tests/run.sh` "AOF: corrupt file refuses to start", "AOF: corruption reported" | 충족 |
 | FR-8.9 | AOF가 RDB보다 우선 | `src/server.c` (`main`) | 자동 테스트 없음 | 미검증 |
 | FR-8.10 | fsync 1초 주기 | `src/aof.c` (`aof_fsync_if_due`), `src/server.c` (`server_cron`) | 자동 테스트 없음 (전원 장애 시나리오 측정 없음) | 미검증 |
-| FR-9.1 | Linux epoll 빌드와 동작 | `src/poller.c` (`__linux__`), `src/zmalloc.c` | `make test` 51 passed, 0 failed (Linux 컨테이너) | 충족 |
-| FR-9.2 | macOS kqueue 빌드와 동작 | `src/poller.c` (`#else`), `src/zmalloc.c` | `make test` 51 passed, 0 failed (2026-11-18, macOS Darwin 27.0.0) | 충족 |
+| FR-9.1 | Linux epoll 빌드와 동작 | `src/poller.c` (`__linux__`), `src/zmalloc.c` | `make test` 55 passed, 0 failed (Linux 컨테이너) | 충족 |
+| FR-9.2 | macOS kqueue 빌드와 동작 | `src/poller.c` (`#else`), `src/zmalloc.c` | `make test` 55 passed, 0 failed (2026-11-18, macOS Darwin 27.0.0) | 충족 |
 | FR-9.3 | CI Linux/macOS `make test` | `.github/workflows/ci.yml` | 워크플로 파일만 있음. 실행 기록은 저장소에 없음 | 미검증 |
 | NFR-1 | 같은 조건 비교 기록 | `bench/run_bench.sh` | `BENCH.md` "측정 조건" (3회 중앙값) | 충족 |
 | NFR-2 | 주기 샘플링 시간 상한 | `src/server.c` (`active_expire_cycle`) | 코드 검사만 (측정 없음) | 미검증 |

@@ -438,13 +438,13 @@ sequenceDiagram
     X->>E: check_oom
     alt maxmemory 0 또는 deny_oom 아님
         E-->>X: 진행
-    else incoming > maxmemory
+    else 키스페이스를 비워도 못 넣음 (floor + incoming > budget)
         E-->>C: -OOM command not allowed (evict 없음)
     else maxmemory 설정됨
-        loop used > maxmemory - incoming, 키가 남은 동안
+        loop used > budget - incoming, 키가 남은 동안
             E->>D: 무작위 5개 중 lru 최소 키 삭제
         end
-        alt used + incoming <= maxmemory
+        alt used + incoming <= budget
             E-->>X: 진행
         else 공간 확보 실패
             E-->>C: -OOM command not allowed
@@ -624,14 +624,19 @@ start = now
 ```
 if deny_oom 아님 또는 maxmemory <= 0: 진행
 incoming = sum(argv[2..] 길이 + 64)
-if incoming > maxmemory: evict 없이 -OOM 응답
-while used_memory > maxmemory - incoming:
+budget = maxmemory + 이 요청 클라이언트의 버퍼(읽기/쓰기 버퍼, argv 복사본)
+floor = 시작 시 빈 키스페이스 기준선 + 해시 테이블 + 접속한 모든 클라이언트
+if floor + incoming > budget: evict 없이 -OOM 응답
+while used_memory > budget - incoming:
     키스페이스에서 dict_random 5번, lru가 가장 작은 키 선택
     키가 하나도 없으면 중단
     그 키 삭제
-if used_memory + incoming > maxmemory: -OOM 응답
+if used_memory + incoming > budget: -OOM 응답
 else: 진행
 ```
+
+- `budget`: 요청 자체의 버퍼는 처리 후 사라지고 eviction으로 줄일 수 없으므로 한도 계산에서 뺀다 (#4).
+- `floor`: 키스페이스를 다 지워도 남는 메모리. 이것만으로 못 넣는 쓰기는 키를 지우지 않고 거부한다 (#1, #4). 크기는 `zmalloc_size`(실제 할당 크기)로 센다.
 
 `lru`는 `db_lookup`에서만 갱신되고 생성 시 0이다.
 
@@ -787,6 +792,8 @@ server_cron (약 100ms마다):
 | `CONFIG SET maxmemory` 값 형식 오류 | `-ERR Invalid argument for CONFIG SET 'maxmemory'` |
 | `CONFIG` 다른 서브명령 | `-ERR Unknown CONFIG subcommand or wrong number of arguments` |
 | 쓰기 하나의 예상 크기가 maxmemory보다 큼 | evict하지 않고 바로 `-OOM`. 기존 키는 그대로 남고 서버는 계속 동작 |
+| 키스페이스를 전부 지워도 들어가지 않는 쓰기 (maxmemory 바로 아래 크기 등) | evict하지 않고 바로 `-OOM` (#4) |
+| maxmemory 안쪽의 큰 쓰기 (요청 버퍼가 사용량에 잡힘) | 요청 버퍼는 한도 계산에서 빼므로 필요한 만큼만 evict 후 성공 (#4) |
 | 새로 쓴 뒤 아직 조회하지 않은 키 | `lru`가 0이라 eviction 후보로 가장 먼저 고려된다 |
 | `SAVE` 실패 (파일 열기, 쓰기, rename 오류) | 임시 파일 삭제, `-ERR error saving DB on disk` |
 | `BGSAVE` 진행 중 다시 `BGSAVE` | `-ERR Background save already in progress` |

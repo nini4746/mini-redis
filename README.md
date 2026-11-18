@@ -126,7 +126,7 @@ make test
 실제 서버를 격리된 임시 디렉터리와 포트 6399(`MINIREDIS_TEST_PORT`로 변경 가능)에 띄우고, 공식 `redis-cli`로 명령을 보내 응답을 검사하는 end-to-end 테스트다 (`tests/run.sh`). `redis-cli`와 `nc`가 필요하다.
 
 - 검사 범위: 프로토콜(inline 포함), string, list/hash/set, TTL, 동시 접속 20개, 파이프라이닝, AOF 재실행과 손상 처리
-- 결과: **51 passed, 0 failed** (Linux 컨테이너에서 실행)
+- 결과: **55 passed, 0 failed** (macOS, Linux 컨테이너)
 
 벤치마크 재현은 `bash bench/run_bench.sh` (`redis-benchmark`, `redis-server` 필요).
 
