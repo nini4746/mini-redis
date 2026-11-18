@@ -320,6 +320,10 @@ int main(int argc, char **argv) {
                     db_size(server.db), server.rdb_filename);
     }
     if (server.aof_enabled && aof_open(server.aof_filename) != AOF_OK) return 1;
+    /* New AOF over data loaded from the RDB: from the next start the AOF
+     * wins, so it must already hold those keys. */
+    if (server.aof_enabled && aof_state == AOF_MISSING && db_size(server.db) > 0)
+        aof_write_keyspace(server.db);
 
     server.listen_fd = setup_listener();
     if (server.listen_fd < 0) return 1;

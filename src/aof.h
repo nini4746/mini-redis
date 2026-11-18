@@ -2,6 +2,7 @@
 #define AOF_H
 
 #include "conn.h"
+#include "db.h"
 
 /* Append-only file: every state change is logged as a RESP command and
  * replayed at startup. Fsynced once a second, so a process crash loses
@@ -19,5 +20,8 @@ int aof_open(const char *path);
 void aof_append(int argc, const arg *argv);
 void aof_append_cstr(int argc, const char **argv, const size_t *lens);
 void aof_fsync_if_due(long long now_ms);
+
+/* Write the whole keyspace into a newly created AOF (TTLs as PEXPIREAT). */
+void aof_write_keyspace(redisDb *db);
 
 #endif

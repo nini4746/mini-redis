@@ -1,5 +1,6 @@
 #include "aof.h"
 #include "command.h"
+#include "list.h"
 #include "resp.h"
 #include "server.h"
 
@@ -66,6 +67,65 @@ int aof_open(const char *path) {
     server.aof_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (server.aof_fd < 0) { perror("open AOF"); return AOF_ERR; }
     return AOF_OK;
+}
+
+/* Write the current keyspace as commands, so a fresh AOF starts from the
+ * data already loaded (from the RDB) instead of from empty. */
+void aof_write_keyspace(redisDb *db) {
+    if (server.aof_fd < 0) return;
+    dictIterator it; dict_iter_init(&it, db->dict);
+    dictEntry *e;
+    while ((e = dict_iter_next(&it))) {
+        robj *o = e->val;
+        switch (o->type) {
+        case OBJ_STRING: {
+            sstr *s = o->ptr;
+            const char *argv[] = { "SET", e->key, s->data };
+            const size_t lens[] = { 3, e->klen, s->len };
+            aof_append_cstr(3, argv, lens);
+            break;
+        }
+        case OBJ_LIST:
+            for (listNode *n = ((mlist *)o->ptr)->head; n; n = n->next) {
+                const char *argv[] = { "RPUSH", e->key, n->value->data };
+                const size_t lens[] = { 5, e->klen, n->value->len };
+                aof_append_cstr(3, argv, lens);
+            }
+            break;
+        case OBJ_HASH: {
+            dictIterator hit; dict_iter_init(&hit, o->ptr);
+            dictEntry *f;
+            while ((f = dict_iter_next(&hit))) {
+                sstr *v = f->val;
+                const char *argv[] = { "HSET", e->key, f->key, v->data };
+                const size_t lens[] = { 4, e->klen, f->klen, v->len };
+                aof_append_cstr(4, argv, lens);
+            }
+            break;
+        }
+        case OBJ_SET: {
+            dictIterator sit; dict_iter_init(&sit, o->ptr);
+            dictEntry *m;
+            while ((m = dict_iter_next(&sit))) {
+                const char *argv[] = { "SADD", e->key, m->key };
+                const size_t lens[] = { 4, e->klen, m->klen };
+                aof_append_cstr(3, argv, lens);
+            }
+            break;
+        }
+        }
+        /* Absolute deadline, as normal logging does for EXPIRE. */
+        long long when = db_get_expire(db, e->key, e->klen);
+        if (when >= 0) {
+            char buf[32];
+            int n = snprintf(buf, sizeof(buf), "%lld", when);
+            const char *argv[] = { "PEXPIREAT", e->key, buf };
+            const size_t lens[] = { 9, e->klen, (size_t)n };
+            aof_append_cstr(3, argv, lens);
+        }
+    }
+    /* Once this file exists the RDB is no longer read: make it durable now. */
+    if (fsync(server.aof_fd) < 0) perror("AOF fsync failed");
 }
 
 int aof_load(const char *path) {
