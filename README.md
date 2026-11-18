@@ -157,6 +157,8 @@ mini-redis/
 
 - [docs/SRS.md](docs/SRS.md) - 요구사항 명세
 - [docs/SDS.md](docs/SDS.md) - 설계 명세: 구성도, 시퀀스, 자료구조와 파일 포맷, 모듈
+- [docs/adr/](docs/adr/README.md) - 설계 결정 기록
+- [CHANGELOG.md](CHANGELOG.md) - 변경 이력
 - [BENCH.md](BENCH.md) - 벤치마크 측정 조건, 전체 수치, 해석
 - [.planning/SPEC.md](.planning/SPEC.md) - 요구사항과 수용 기준
 - [.planning/plans/](.planning/plans/) - 단계별 구현 계획
