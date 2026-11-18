@@ -8,26 +8,28 @@
 
 ### 1.1 목적
 
-이 문서는 mini-redis의 요구사항을 정의한다. mini-redis는 C로 만든 macOS용 단일 노드 Redis 호환 서버다. 진짜 `redis-cli`와 `redis-benchmark`가 그대로 접속해 동작하고, 같은 조건에서 진짜 Redis와 성능을 비교해 기록하는 것이 완료 조건이다. 설계는 [SDS](SDS.md)에서 다룬다.
+이 문서는 mini-redis의 요구사항을 정의한다. mini-redis는 C로 만든 Linux와 macOS용 단일 노드 Redis 호환 서버다. 진짜 `redis-cli`와 `redis-benchmark`가 그대로 접속해 동작하고, 같은 조건에서 진짜 Redis와 성능을 비교해 기록하는 것이 완료 조건이다. 설계는 [SDS](SDS.md)에서 다룬다.
 
 ### 1.2 범위
 
 mini-redis가 하는 일은 다음과 같다. 하지 않는 일은 [부록 B](#부록-b-범위-외-항목)에 있다.
 
 - RESP2 프로토콜 처리 (multibulk와 inline, incremental 파싱)
-- kqueue 기반 단일 스레드 이벤트 루프, 논블로킹 소켓
+- epoll(Linux)과 kqueue(macOS) 기반 단일 스레드 이벤트 루프, 논블로킹 소켓. 두 API는 `poller.c`가 같은 인터페이스로 감싼다
 - 자료구조: string, list, hash, set
-- 명령 30개: PING, ECHO, GET, SET, DEL, EXISTS, INCR, DBSIZE, FLUSHALL, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, HSET, HGET, HDEL, HGETALL, SADD, SREM, SISMEMBER, SMEMBERS, SCARD, EXPIRE, TTL, PERSIST, CONFIG (GET/SET maxmemory), SAVE, BGSAVE
+- 명령 31개: PING, ECHO, GET, SET, DEL, EXISTS, INCR, DBSIZE, FLUSHALL, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, HSET, HGET, HDEL, HGETALL, SADD, SREM, SISMEMBER, SMEMBERS, SCARD, EXPIRE, TTL, PERSIST, PEXPIREAT, CONFIG (GET/SET maxmemory), SAVE, BGSAVE
 - TTL 만료: 지연 삭제 + 주기 샘플링
 - maxmemory + LRU 근사 eviction (allkeys-lru만)
 - RDB 스냅샷: fork + COW, 자체 바이너리 포맷 `dump.mrdb`, 기동 시 로드
+- AOF 영속화 (`--appendonly`): 상태를 바꾸는 명령을 RESP 그대로 `appendonly.aof`에 기록하고 기동 시 재실행. fsync 1초 주기
+- Linux와 macOS에서 `make test`를 돌리는 CI (GitHub Actions)
 - `redis-benchmark` 비교 측정과 `BENCH.md` 기록
 
 ### 1.3 제품 개요
 
 #### 1.3.1 제품 관점
 
-mini-redis는 독립 실행 서버 프로세스다. 클라이언트는 TCP로 접속하고, 서버는 현재 디렉터리의 스냅샷 파일을 읽고 쓴다. 진짜 Redis는 벤치마크 비교 대상으로만 쓰인다.
+mini-redis는 독립 실행 서버 프로세스다. 클라이언트는 TCP로 접속하고, 서버는 현재 디렉터리의 스냅샷 파일과 AOF 파일(`--appendonly`일 때)을 읽고 쓴다. 진짜 Redis는 벤치마크 비교 대상으로만 쓰인다.
 
 ```mermaid
 flowchart LR
@@ -36,6 +38,8 @@ flowchart LR
     NC["nc (inline)"] -->|"TCP"| MR
     MR -->|"SAVE / BGSAVE"| FILE["dump.mrdb"]
     FILE -->|"기동 시 로드"| MR
+    MR -->|"쓰기 명령 추가 (--appendonly)"| AOF["appendonly.aof"]
+    AOF -->|"기동 시 재실행"| MR
     BENCH -->|"TCP 6379"| REAL["진짜 Redis (비교용)"]
 ```
 
@@ -46,24 +50,25 @@ flowchart LR
 - 키에 만료 시각을 걸고, 지난 키를 접근 시점과 주기 작업 두 경로로 지운다
 - 메모리 상한을 넘으면 오래 쓰지 않은 키를 지우고, 더 지울 수 없으면 쓰기를 거부한다
 - 전체 데이터를 파일로 저장하고, 기동 시 복원한다. 백그라운드 저장 중에도 요청을 받는다
+- `--appendonly`면 상태를 바꾸는 명령을 로그 파일에 덧붙이고, 기동 시 그 로그를 재실행해 상태를 복원한다
 
 #### 1.3.3 사용자 특성
 
 | 사용자 | 특성 |
 |--------|------|
-| 학습자 / 개발자 | Redis 명령과 `redis-cli` 사용법을 안다. 이벤트 루프, TTL/LRU, fork 기반 영속화 동작을 직접 확인하려 한다 |
+| 학습자 / 개발자 | Redis 명령과 `redis-cli` 사용법을 안다. 이벤트 루프, TTL/LRU, fork 기반 스냅샷과 AOF 영속화 동작을 직접 확인하려 한다 |
 | 클라이언트 도구 | `redis-cli`, `redis-benchmark`. RESP2 multibulk로 요청을 보내고, `redis-benchmark`의 PING_INLINE 테스트는 inline 형식을 쓴다 |
 
 #### 1.3.4 제한 사항
 
 | 항목 | 내용 |
 |------|------|
-| 언어 | C11 (`cc -std=c11 -Wall -Wextra -O2`) |
-| 플랫폼 | macOS 전용. 멀티플렉싱은 kqueue, 메모리 추적은 `malloc_size()` (`<malloc/malloc.h>`) |
+| 언어 | C11 GNU 확장 (`cc -std=gnu11 -Wall -Wextra -O2`) |
+| 플랫폼 | Linux와 macOS. 멀티플렉싱은 Linux에서 epoll, macOS에서 kqueue (`poller.c`, `__linux__`로 분기). 메모리 추적은 Linux에서 `malloc_usable_size()` (`<malloc.h>`), macOS에서 `malloc_size()` (`<malloc/malloc.h>`) |
 | 의존성 | 외부 라이브러리 없음. libc와 시스템 콜만 사용 |
 | 스레딩 | 단일 스레드 이벤트 루프. `BGSAVE`용 fork 자식 프로세스만 예외 |
 | 빌드 | `make` (산출물 `mini-redis`) |
-| 테스트 환경 | `redis-cli`, `nc` 필요 (`make test`) |
+| 테스트 환경 | `redis-cli`, `nc` 필요 (`make test`). CI는 Linux에서 `redis-tools`, `netcat-openbsd`, macOS에서 `brew install redis`로 설치 |
 | 벤치 환경 | `redis-benchmark`, `redis-server` 필요 (`bench/run_bench.sh`). 대체 부하 도구 `bench/loadgen.py`는 `python3` 필요 |
 
 ### 1.4 용어 정의
@@ -73,7 +78,9 @@ flowchart LR
 | RESP2 | Redis 클라이언트-서버 통신 형식 (버전 2). 요청은 배열, 응답은 5가지 타입 |
 | multibulk | `*<개수>\r\n$<길이>\r\n<바이트>\r\n...` 형태의 배열 요청. `redis-cli`가 보내는 기본 형식 |
 | inline 명령 | `PING\r\n`처럼 공백으로 인자를 나눈 한 줄 평문 요청 (telnet식) |
+| epoll | Linux에서 여러 파일 디스크립터(fd)의 읽기/쓰기 가능 여부를 한 번에 감시하는 시스템 콜 |
 | kqueue | macOS에서 여러 파일 디스크립터(fd)의 읽기/쓰기 가능 여부를 한 번에 감시하는 시스템 콜 |
+| poller | epoll과 kqueue를 같은 함수(`poller_create`, `poller_add`, `poller_del`, `poller_set_write`, `poller_wait`)로 감싼 추상화 (`poller.c`) |
 | 논블로킹 소켓 | 데이터가 없으면 기다리지 않고 즉시 `EAGAIN`을 반환하는 소켓 |
 | 부분 수신 | 요청 하나가 여러 번의 `read()`로 나뉘어 도착하는 상황 |
 | 파이프라이닝 | 클라이언트가 응답을 기다리지 않고 여러 요청을 연달아 보내는 방식 |
@@ -84,6 +91,8 @@ flowchart LR
 | eviction | 메모리 상한을 넘을 때 기존 키를 지워 공간을 확보하는 동작 |
 | LRU 근사 | 무작위 샘플 중 가장 오래 접근되지 않은 키를 고르는 방식 (Least Recently Used의 근사) |
 | RDB 스냅샷 | 전체 키스페이스를 파일 하나에 저장한 것. 이 프로젝트는 자체 포맷 `dump.mrdb`를 쓴다 |
+| AOF | Append-only file. 상태를 바꾸는 명령을 RESP 형식 그대로 파일 끝에 덧붙인 로그. 기동 시 재실행해 상태를 복원한다 |
+| fsync | 커널 버퍼의 파일 내용을 디스크에 내려쓰게 하는 시스템 콜 |
 | fork / COW | `fork()`로 만든 자식 프로세스가 부모 메모리를 공유하다가 바뀐 페이지만 복사하는 방식 (copy-on-write) |
 | WRONGTYPE | 키에 저장된 값의 타입과 명령이 맞지 않을 때의 오류 |
 | OOM | 메모리 상한 때문에 쓰기를 거부할 때의 오류 (out of memory) |
@@ -98,6 +107,7 @@ flowchart LR
 | [.planning/SPEC.md](../.planning/SPEC.md) | 원본 요구사항 (R1-R7)과 수용 기준 |
 | [tests/run.sh](../tests/run.sh) | end-to-end 테스트 |
 | [bench/run_bench.sh](../bench/run_bench.sh) | 진짜 Redis와 나란히 측정하는 벤치 스크립트 |
+| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Linux와 macOS에서 `make test`를 돌리는 CI |
 
 ## 3. 요구사항
 
@@ -107,7 +117,7 @@ flowchart LR
 
 | 설명 | 우선순위 | 출처 | 검증 방법 |
 |------|----------|------|-----------|
-| 서버는 kqueue 단일 스레드 이벤트 루프 위에서 RESP2 요청을 incremental 파싱해 다수 클라이언트를 처리해야 한다 | 필수 | SPEC R1 | 시험 |
+| 서버는 단일 스레드 이벤트 루프(Linux epoll, macOS kqueue) 위에서 RESP2 요청을 incremental 파싱해 다수 클라이언트를 처리해야 한다 | 필수 | SPEC R1 | 시험 |
 
 수용 기준:
 
@@ -215,13 +225,44 @@ flowchart LR
 - 진짜 Redis를 같은 옵션, 영속화 끈 상태로 측정한 수치가 측정 조건과 함께 나란히 기록된다
 - 차이가 어디서 오는지 추정한 해석이 포함된다
 
+#### FR-8 AOF 영속화
+
+| 설명 | 우선순위 | 출처 | 검증 방법 |
+|------|----------|------|-----------|
+| 서버는 `--appendonly`로 켜면 상태를 바꾸는 명령을 RESP 그대로 `appendonly.aof`에 기록하고, 기동 시 이 파일을 재실행해 상태를 복원해야 한다 | 선택 | 커밋 b887a6a, README "AOF 영속화" | 시험, 검사 |
+
+수용 기준:
+
+- string, list, hash, set, 카운터에 대한 쓰기 명령이 재시작 후 재실행되어 같은 상태가 된다
+- 프로세스가 `kill -9`로 죽어도 재시작 후 유실이 없다
+- `DEL`로 지운 키는 재시작 후에도 없다
+- `EXPIRE`는 절대 시각(`PEXPIREAT`)으로 기록해 재시작해도 TTL이 다시 늘어나지 않는다
+- 이미 만료된 키는 재시작 후 되살아나지 않는다
+- eviction으로 지운 키는 `DEL`로 기록해 재실행 후 되살아나지 않는다
+- 쓰다 끊긴 마지막 명령은 잘라내고 경고를 남기며, 그 앞의 데이터는 유지된다. 파일은 마지막 온전한 명령 끝까지로 잘린다
+- 그 외 손상이 있으면 FATAL 로그 후 종료 코드 1로 기동을 거부한다
+- AOF가 있으면 RDB보다 AOF를 우선해 로드한다
+- fsync는 1초 주기다. 프로세스 크래시에는 유실이 없고, 전원 장애 시 최대 약 1초분이 유실될 수 있다
+
+#### FR-9 Linux와 macOS 지원
+
+| 설명 | 우선순위 | 출처 | 검증 방법 |
+|------|----------|------|-----------|
+| 서버는 Linux(epoll)와 macOS(kqueue)에서 같은 소스로 빌드되고 같은 동작을 해야 한다. 플랫폼 API는 `poller` 인터페이스 뒤에 둔다 | 선택 | 커밋 b887a6a, README | 시험 |
+
+수용 기준:
+
+- Linux에서 epoll 기반으로 빌드되고 `make test`를 통과한다
+- macOS에서 kqueue 기반으로 빌드되고 `make test`를 통과한다
+- CI(GitHub Actions)가 push와 pull request마다 `ubuntu-latest`, `macos-latest`에서 `make test`를 실행한다
+
 ### 3.2 성능 요구사항
 
 | ID | 요구사항 | 목표치 | 검증 방법 |
 |----|----------|--------|-----------|
 | NFR-1 | 진짜 Redis와 같은 조건에서 처리량을 비교한다. 절대 목표치는 없다 | 같은 머신, 같은 `-n`/`-c`/`-P`, 진짜 Redis 영속화 OFF, 3회 측정 중앙값 기록 | 검사 (`BENCH.md`) |
 | NFR-2 | 주기 샘플링이 이벤트 루프를 오래 막지 않는다 | 100ms마다 샘플 20개, 반복은 최대 16회 및 25ms 이내 | 검사 (코드) |
-| NFR-3 | 응답을 쓰기 버퍼에 모아 한 번에 `write()` 하고, 소켓이 가득 차면 나중에 이어 쓴다 | `EAGAIN` 시 `EVFILT_WRITE` 등록 후 재개 | 시연 (`BENCH.md` `-P 16` 완주) |
+| NFR-3 | 응답을 쓰기 버퍼에 모아 한 번에 `write()` 하고, 소켓이 가득 차면 나중에 이어 쓴다 | `EAGAIN` 시 쓰기 감시 등록(`poller_set_write`: epoll `EPOLLOUT`, kqueue `EVFILT_WRITE`) 후 재개 | 시연 (`BENCH.md` `-P 16` 완주) |
 
 ### 3.3 사용성 요구사항
 
@@ -234,10 +275,11 @@ flowchart LR
 
 | 종류 | 인터페이스 | 요구사항 |
 |------|------------|----------|
-| 사용자 | 명령행 `./mini-redis [--port N \| -p N]` | 포트 범위 1-65535. 잘못된 인자는 에러 메시지 후 종료 코드 1 |
-| 사용자 | 표준 에러 로그 | 기동 포트, 로드한 키 개수, 손상 스냅샷, `BGSAVE` 결과를 출력한다 |
-| 소프트웨어 | libc, BSD 소켓, kqueue, `fork`/`waitpid` | 외부 라이브러리 없이 이것만 사용한다 |
+| 사용자 | 명령행 `./mini-redis [--port N \| -p N] [--appendonly]` | 포트 범위 1-65535. `--appendonly`는 AOF 영속화를 켠다. 잘못된 인자는 에러 메시지 후 종료 코드 1 |
+| 사용자 | 표준 에러 로그 | 기동 포트, 로드한 키 개수, 손상 스냅샷, 손상 AOF, 잘라낸 AOF 꼬리 바이트 수, `BGSAVE` 결과를 출력한다 |
+| 소프트웨어 | libc, BSD 소켓, epoll(Linux) 또는 kqueue(macOS), `fork`/`waitpid`, `fsync`/`truncate` | 외부 라이브러리 없이 이것만 사용한다 |
 | 소프트웨어 | 파일 `dump.mrdb` | 현재 디렉터리에 자체 바이너리 포맷으로 읽고 쓴다 |
+| 소프트웨어 | 파일 `appendonly.aof` | `--appendonly`일 때 현재 디렉터리에 RESP multibulk 명령을 덧붙이고, 기동 시 읽는다 |
 | 통신 | TCP, 모든 IPv4 주소(`INADDR_ANY`), 기본 포트 6380 | 진짜 Redis 기본 포트 6379와 겹치지 않는다 |
 | 통신 | RESP2 | multibulk와 inline 요청, `+` `-` `:` `$` `*` 응답 타입 |
 
@@ -250,15 +292,17 @@ flowchart LR
 | 접근 시각 | 값 객체마다 마지막 접근 시각(ms)을 저장해 eviction에 쓴다 |
 | 메모리 사용량 | 서버 전체의 근사 할당 바이트 수를 유지한다 |
 | 스냅샷 | 모든 키, 값, 만료 시각을 파일에 저장한다. 저장 시점에 이미 만료된 키는 뺀다. 접근 시각은 저장하지 않는다 |
+| AOF | 서버가 받아들인 상태 변경 명령을 순서대로 저장한다. 만료는 절대 시각(`PEXPIREAT`), eviction은 `DEL`로 저장한다. 파일은 계속 커진다 (rewrite 없음) |
 
 자료구조와 바이트 배치는 [SDS 3.4 정보 뷰](SDS.md#34-정보-뷰)에 있다.
 
 ### 3.6 설계 제약
 
-- C11, 외부 라이브러리 금지 (libc와 시스템 콜만)
-- macOS 전용, 멀티플렉싱은 kqueue
+- C11 (GNU 확장, `-std=gnu11`), 외부 라이브러리 금지 (libc와 시스템 콜만)
+- Linux와 macOS 지원. 멀티플렉싱은 epoll(Linux)과 kqueue(macOS)이며 `poller` 인터페이스 뒤에 둔다
 - 단일 스레드 이벤트 루프 (`BGSAVE` fork 자식만 예외)
 - 스냅샷은 자체 포맷이며 진짜 RDB 포맷과 호환하지 않는다
+- AOF 파일 이름은 `appendonly.aof`로 고정이고, fsync 정책은 1초 주기 하나다
 - 해시테이블 리사이즈는 일괄 방식 (incremental rehash 없음)
 - eviction 정책은 allkeys-lru 근사 하나
 - 메모리 판정은 RSS가 아닌 malloc 래퍼 기반 근사
@@ -274,9 +318,10 @@ flowchart LR
 | NFR-10 | 가용성 | `BGSAVE` 중에도 요청을 계속 처리한다 | 부모는 fork 직후 응답하고 이벤트 루프로 복귀 |
 | NFR-11 | 보안 | 비정상적으로 큰 입력으로 메모리를 소진시키지 못한다 | 인자 개수 1,048,576개, bulk 512MB, inline 한 줄 64KiB, 헤더 줄 64바이트 상한. 스냅샷 길이 필드 512MB 상한 |
 | NFR-12 | 유지보수성 | 명령 추가가 한 곳에서 끝난다 | 이름, 핸들러, arity, 메모리 증가 여부를 담은 명령 테이블 하나 |
-| NFR-13 | 유지보수성 | 메모리 사용량을 RSS가 아닌 할당 추적으로 근사한다 | 모든 할당이 `zmalloc` 래퍼를 지나며 `malloc_size()` 합계를 유지. 바이트 정확도는 요구하지 않음 |
+| NFR-13 | 유지보수성 | 메모리 사용량을 RSS가 아닌 할당 추적으로 근사한다 | 모든 할당이 `zmalloc` 래퍼를 지나며 블록 크기(macOS `malloc_size()`, Linux `malloc_usable_size()`) 합계를 유지. 바이트 정확도는 요구하지 않음 |
 | NFR-14 | 유지보수성 | 큰 요청 하나가 버퍼 메모리를 계속 점유하지 않는다 | 다 비운 읽기/쓰기 버퍼가 64KiB를 넘으면 해제 |
-| NFR-15 | 이식성 | macOS에서만 빌드하고 동작한다 | kqueue, `malloc_size()` 의존 |
+| NFR-15 | 이식성 | Linux와 macOS에서 빌드하고 동작한다 | 플랫폼 의존 코드는 `poller.c`(epoll/kqueue)와 `zmalloc.c`(`malloc_usable_size`/`malloc_size`)의 `__linux__` 분기에만 둔다 |
+| NFR-16 | 신뢰성 | AOF에 쓸 수 없는 쓰기를 성공으로 응답하지 않는다 | AOF `write()` 실패 시 FATAL 로그 후 프로세스 종료 |
 
 ### 3.8 금지 조건 (must-NOT)
 
@@ -285,6 +330,8 @@ flowchart LR
 - maxmemory가 0일 때 eviction이 발동하지 않는다
 - `BGSAVE` 실패(fork 실패, 디스크 오류)가 서버 크래시로 이어지지 않는다
 - 손상된 스냅샷을 빈 DB로 조용히 대체해 데이터 유실을 가리지 않는다
+- 손상된 AOF를 무시하고 기동해 데이터 유실을 가리지 않는다 (끊긴 마지막 명령만 예외로 잘라낸다)
+- AOF 재실행 중에 실행한 명령을 AOF에 다시 기록하지 않는다
 - `BGSAVE` 자식 프로세스는 상속받은 클라이언트 소켓에 응답하지 않는다
 
 ## 4. 검증
@@ -293,12 +340,13 @@ flowchart LR
 
 | 방법 | 도구 | 다루는 것 | 실행 |
 |------|------|-----------|------|
-| 시험 | `tests/run.sh` | 실제 서버를 빈 임시 디렉터리와 포트 6399(`MINIREDIS_TEST_PORT`로 변경)에 띄우고 공식 `redis-cli`와 `nc`로 응답을 검사한다. 프로토콜(inline 포함), string, list/hash/set, TTL, 동시 접속 20개, 파이프라이닝. 현재 결과 33 passed, 0 failed | `make test` |
+| 시험 | `tests/run.sh` | 실제 서버를 빈 임시 디렉터리와 포트 6399(`MINIREDIS_TEST_PORT`로 변경)에 띄우고 공식 `redis-cli`와 `nc`로 응답을 검사한다. 프로토콜(inline 포함), string, list/hash/set, TTL, 동시 접속 20개, 파이프라이닝, AOF 재실행과 손상 처리(포트 +1에 `--appendonly` 서버를 따로 띄움). 현재 결과 45 passed, 0 failed (Linux 컨테이너에서 실행. 2026-11-18 macOS Darwin 27.0.0에서도 45 passed, 0 failed) | `make test` |
+| 시험 (CI) | `.github/workflows/ci.yml` | push와 pull request마다 `ubuntu-latest`, `macos-latest`에서 `make test`. 실행 기록은 저장소에 없다 | GitHub Actions |
 | 시연 | `bench/run_bench.sh` | mini-redis(6380)와 진짜 Redis(6379, 영속화 OFF)를 같은 `redis-benchmark` 옵션으로 측정한다 | `bash bench/run_bench.sh` |
 | 시연 | `bench/loadgen.py` | `redis-benchmark`가 없을 때 mini-redis 단독 부하를 걸어 완주 여부와 처리량을 본다. 비교 근거로는 쓰지 않는다 | `python3 bench/loadgen.py` |
 | 검사 | `BENCH.md`, 소스 코드 | 측정 조건과 수치, 상한 값과 알고리즘 상수 | 문서/코드 확인 |
 
-FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미검증이다.
+FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미검증이다. FR-8 (AOF)은 eviction 기록, RDB 대비 우선순위, fsync 주기에 자동 테스트가 없다. FR-8, FR-9는 SPEC(R1-R7) 이후 커밋 b887a6a에서 추가되어 SPEC 번호가 없다.
 
 ### 4.2 요구사항 추적표
 
@@ -353,9 +401,22 @@ FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미�
 | FR-7.2 | `-P 16` 완주 | `src/*` | `BENCH.md` 결과 표 (`-P16` 열) | 충족 |
 | FR-7.3 | 진짜 Redis 나란히 기록, 조건 명시 | `bench/run_bench.sh` | `BENCH.md` "측정 조건", "결과 표" | 충족 |
 | FR-7.4 | 차이 원인 해석 | `BENCH.md` | `BENCH.md` "해석" | 충족 |
+| FR-8.1 | 쓰기 명령 기록과 재실행 | `src/aof.c` (`aof_append`, `aof_load`), `src/command.c` (`log_aof`, `command_dispatch`), `src/server.c` (`main`) | `tests/run.sh` "AOF: list state replayed", "AOF: hash replayed", "AOF: set replayed", "AOF: counter replayed" | 충족 |
+| FR-8.2 | `kill -9` 후 유실 없음 | `src/aof.c` | `tests/run.sh` "AOF: string survives kill -9" | 충족 |
+| FR-8.3 | DEL한 키 유지 삭제 | `src/command.c` (`DEL` `log_aof`) | `tests/run.sh` "AOF: deleted key stays deleted" | 충족 |
+| FR-8.4 | `PEXPIREAT`로 TTL 유지 | `src/command.c` (`aof_log_deadline`, `pexpireat_cmd`) | `tests/run.sh` "AOF: TTL kept, not restarted" | 충족 |
+| FR-8.5 | 만료 키 미부활 | `src/command.c` (`pexpireat_cmd`) | `tests/run.sh` "AOF: expired key not revived" | 충족 |
+| FR-8.6 | eviction을 `DEL`로 기록 | `src/command.c` (`evict_until`) | 자동 테스트 없음 | 미검증 |
+| FR-8.7 | 끊긴 꼬리 잘라내기 | `src/aof.c` (`aof_load`, `truncate`) | `tests/run.sh` "AOF: partial tail cut, data kept", "AOF: file cut back to last command" | 충족 |
+| FR-8.8 | 손상 시 기동 거부 | `src/aof.c` (`aof_load`), `src/server.c` (`main`) | `tests/run.sh` "AOF: corrupt file refuses to start", "AOF: corruption reported" | 충족 |
+| FR-8.9 | AOF가 RDB보다 우선 | `src/server.c` (`main`) | 자동 테스트 없음 | 미검증 |
+| FR-8.10 | fsync 1초 주기 | `src/aof.c` (`aof_fsync_if_due`), `src/server.c` (`server_cron`) | 자동 테스트 없음 (전원 장애 시나리오 측정 없음) | 미검증 |
+| FR-9.1 | Linux epoll 빌드와 동작 | `src/poller.c` (`__linux__`), `src/zmalloc.c` | `make test` 45 passed, 0 failed (Linux 컨테이너) | 충족 |
+| FR-9.2 | macOS kqueue 빌드와 동작 | `src/poller.c` (`#else`), `src/zmalloc.c` | `make test` 45 passed, 0 failed (2026-11-18, macOS Darwin 27.0.0) | 충족 |
+| FR-9.3 | CI Linux/macOS `make test` | `.github/workflows/ci.yml` | 워크플로 파일만 있음. 실행 기록은 저장소에 없음 | 미검증 |
 | NFR-1 | 같은 조건 비교 기록 | `bench/run_bench.sh` | `BENCH.md` "측정 조건" (3회 중앙값) | 충족 |
 | NFR-2 | 주기 샘플링 시간 상한 | `src/server.c` (`active_expire_cycle`) | 코드 검사만 (측정 없음) | 미검증 |
-| NFR-3 | 쓰기 백프레셔 | `src/server.c` (`flush_write`, `el_set_write`) | `BENCH.md` `-P 16` 완주 | 충족 |
+| NFR-3 | 쓰기 백프레셔 | `src/server.c` (`flush_write`, `el_set_write`), `src/poller.c` (`poller_set_write`) | `BENCH.md` `-P 16` 완주 | 충족 |
 | NFR-4 | Redis 형식 오류 응답 | `src/command.c`, `src/resp.c` | `tests/run.sh` "INCR non-int -> error", "WRONGTYPE: GET on list" | 충족 |
 | NFR-5 | 명령 대소문자 무시 | `src/command.c` (`lookup_command`) | 자동 테스트 없음 | 미검증 |
 | NFR-6 | 스냅샷 원자 교체 | `src/rdb.c` (`rdb_save`) | 자동 테스트 없음 | 미검증 |
@@ -367,13 +428,16 @@ FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미�
 | NFR-12 | 명령 테이블 | `src/command.c` (`command_table`) | 코드 검사 | 충족 |
 | NFR-13 | zmalloc 할당 추적 | `src/zmalloc.c` | 자동 테스트 없음 | 미검증 |
 | NFR-14 | 큰 버퍼 해제 | `src/server.c` (`read_from_client`, `flush_write`) | 자동 테스트 없음 | 미검증 |
-| NFR-15 | macOS 전용 | `src/server.c`, `src/zmalloc.c` | `BENCH.md` 측정 환경 (macOS 26.5.1)에서 빌드와 측정 | 충족 |
+| NFR-15 | Linux와 macOS 이식성 | `src/poller.c`, `src/zmalloc.c` | FR-9.1, FR-9.2와 같음 | 충족 |
+| NFR-16 | AOF 쓰기 실패 시 종료 | `src/aof.c` (`write_all`) | 자동 테스트 없음 | 미검증 |
 
 ## 부록 A. 가정과 의존성
 
 - 테스트 머신에 `redis-cli`와 `nc`가 있다. 벤치 머신에는 `redis-benchmark`, `redis-server`가 추가로 있다
 - 서버는 로컬 학습용으로 신뢰할 수 있는 네트워크에서만 쓴다 (인증 없음)
-- 서버를 실행한 현재 디렉터리에 쓰기 권한이 있어야 `SAVE`/`BGSAVE`가 성공한다
+- 서버를 실행한 현재 디렉터리에 쓰기 권한이 있어야 `SAVE`/`BGSAVE`와 AOF 기록이 성공한다
+- `BENCH.md`의 수치는 macOS(26.5.1)에서 측정했다. Linux에서는 벤치마크를 측정하지 않았다
+- AOF 재실행 중 `-ERR`로 시작하는 응답이 나오면 손상으로 본다 (`aof_load`). 기록은 핸들러 실행 전에 일어나므로, 핸들러가 `-ERR`로 거부한 명령도 파일에 남아 이 판정에 걸릴 수 있다 ([SDS 5](SDS.md#5-오류-처리와-엣지-케이스))
 - 만료 시각과 접근 시각은 벽시계(`gettimeofday`) 기준 ms다. 시스템 시각이 바뀌면 만료 판정도 따라 바뀐다
 - 데이터베이스는 하나뿐이다 (SELECT 없음)
 
@@ -381,7 +445,8 @@ FR-5 (eviction)와 FR-6 (스냅샷)은 자동 테스트가 없어 대부분 미�
 
 | 항목 | 이유 |
 |------|------|
-| AOF 영속화 | RDB만으로 fork + COW 영속화 개념을 다룰 수 있다 |
+| AOF rewrite (압축) | 구현하지 않았다. AOF 파일은 계속 커진다 |
+| `appendfsync` 정책 선택 (always, no) | 1초 주기 하나만 지원한다 |
 | pub/sub | 키스페이스 동작과 별개인 기능이다 |
 | 복제, 클러스터, Sentinel | 단일 노드 범위를 넘는다 |
 | RESP3, HELLO | `redis-cli`는 RESP2로 동작한다 |
